@@ -2,6 +2,8 @@
 
 Translate your **positive prompt** inside Forge NEO / A1111 WebUI with one key press or live auto-translation.
 
+<img width="923" height="308" alt="47567" src="https://github.com/user-attachments/assets/342c8d23-5514-4c78-9f2b-8dfdc2c438c6" />
+
 ## Features
 
 - Works in both `txt2img` and `img2img`
