@@ -52,6 +52,12 @@ extensions/prompt-translator/
 2. Restart Forge NEO / WebUI.
 3. Dependencies are installed through `install.py` (`deep-translator`, `langdetect`).
 
+Alternative (recommended for GitHub users):
+1. Open WebUI -> `Extensions` tab -> `Install from URL`.
+2. Paste repository URL:
+   - `https://github.com/abzaloff/small-translate.git`
+3. Click `Install`, then restart Forge NEO / WebUI.
+
 ## Usage
 
 Default state on each Forge UI load:
