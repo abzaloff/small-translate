@@ -204,6 +204,16 @@
     textarea.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
+  function preserveBoundaryWhitespace(originalText, translatedText) {
+    const source = typeof originalText === "string" ? originalText : "";
+    const translated = typeof translatedText === "string" ? translatedText : "";
+
+    const leading = (source.match(/^\s+/) || [""])[0];
+    const trailing = (source.match(/\s+$/) || [""])[0];
+
+    return leading + translated.trim() + trailing;
+  }
+
   async function callTranslateApi(text, source, target) {
     const payload = { text, source, target };
     const endpoints = [
@@ -294,7 +304,11 @@
         return true;
       }
       if (result && typeof result.translated_text === "string") {
-        applyPromptValue(promptArea, result.translated_text, {
+        const normalizedTranslatedText = preserveBoundaryWhitespace(
+          currentText,
+          result.translated_text,
+        );
+        applyPromptValue(promptArea, normalizedTranslatedText, {
           suppressInputEvent: options && options.suppressInputEvent === true,
         });
       }
