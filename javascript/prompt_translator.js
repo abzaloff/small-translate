@@ -53,34 +53,77 @@
     return document;
   }
 
-  function getStoredEnabled() {
-    return localStorage.getItem(STORAGE_KEYS.enabled) === "1";
+  function resolveTabName(tabOrName) {
+    if (!tabOrName) {
+      return "";
+    }
+    if (typeof tabOrName === "string") {
+      return tabOrName;
+    }
+    if (typeof tabOrName === "object" && typeof tabOrName.name === "string") {
+      return tabOrName.name;
+    }
+    return "";
   }
 
-  function getStoredSource() {
-    const value = localStorage.getItem(STORAGE_KEYS.source) || "Auto Detect";
+  function tabStorageKey(baseKey, tabOrName) {
+    const tabName = resolveTabName(tabOrName);
+    return tabName ? baseKey + "_" + tabName : baseKey;
+  }
+
+  function getStorageValueWithLegacy(tabOrName, baseKey, fallback = "") {
+    const scopedKey = tabStorageKey(baseKey, tabOrName);
+    const scopedValue = localStorage.getItem(scopedKey);
+    if (scopedValue !== null) {
+      return scopedValue;
+    }
+    const legacyValue = localStorage.getItem(baseKey);
+    if (legacyValue !== null) {
+      return legacyValue;
+    }
+    return fallback;
+  }
+
+  function getStoredEnabled(tabOrName) {
+    return getStorageValueWithLegacy(tabOrName, STORAGE_KEYS.enabled, "0") === "1";
+  }
+
+  function setStoredEnabled(tabOrName, enabled) {
+    localStorage.setItem(tabStorageKey(STORAGE_KEYS.enabled, tabOrName), enabled ? "1" : "0");
+  }
+
+  function getStoredSource(tabOrName) {
+    const value = getStorageValueWithLegacy(tabOrName, STORAGE_KEYS.source, "Auto Detect");
     return FROM_LANGUAGES.includes(value) ? value : "Auto Detect";
   }
 
-  function getStoredTarget() {
-    const value = localStorage.getItem(STORAGE_KEYS.target) || "English";
+  function setStoredSource(tabOrName, value) {
+    localStorage.setItem(tabStorageKey(STORAGE_KEYS.source, tabOrName), value);
+  }
+
+  function getStoredTarget(tabOrName) {
+    const value = getStorageValueWithLegacy(tabOrName, STORAGE_KEYS.target, "English");
     return TO_LANGUAGES.includes(value) ? value : "English";
   }
 
-  function getLastDetectedSource() {
-    const value = localStorage.getItem(STORAGE_KEYS.lastDetectedSource) || "";
+  function setStoredTarget(tabOrName, value) {
+    localStorage.setItem(tabStorageKey(STORAGE_KEYS.target, tabOrName), value);
+  }
+
+  function getLastDetectedSource(tabOrName) {
+    const value = getStorageValueWithLegacy(tabOrName, STORAGE_KEYS.lastDetectedSource, "");
     return TO_LANGUAGES.includes(value) ? value : "";
   }
 
-  function setLastDetectedSource(value) {
+  function setLastDetectedSource(tabOrName, value) {
     if (TO_LANGUAGES.includes(value)) {
-      localStorage.setItem(STORAGE_KEYS.lastDetectedSource, value);
+      localStorage.setItem(tabStorageKey(STORAGE_KEYS.lastDetectedSource, tabOrName), value);
     }
   }
 
-  function setLastTarget(value) {
+  function setLastTarget(tabOrName, value) {
     if (TO_LANGUAGES.includes(value)) {
-      localStorage.setItem(STORAGE_KEYS.lastTarget, value);
+      localStorage.setItem(tabStorageKey(STORAGE_KEYS.lastTarget, tabOrName), value);
     }
   }
 
@@ -157,39 +200,44 @@
     return select;
   }
 
-  function broadcastSettings() {
-    const enabled = getStoredEnabled();
-    const source = getStoredSource();
-    const target = getStoredTarget();
-
-    for (const row of state.rows.values()) {
-      row.checkbox.checked = enabled;
-      row.fromSelect.value = source;
-      row.toSelect.value = target;
+  function broadcastSettings(preferredTab) {
+    for (const [tabName, row] of state.rows.entries()) {
+      if (preferredTab && tabName !== resolveTabName(preferredTab)) {
+        continue;
+      }
+      row.checkbox.checked = getStoredEnabled(tabName);
+      row.fromSelect.value = getStoredSource(tabName);
+      row.toSelect.value = getStoredTarget(tabName);
     }
   }
 
-  async function swapLanguages() {
-    const source = getStoredSource();
-    const target = getStoredTarget();
-    if (source === "Auto Detect") {
-      const detected = getLastDetectedSource() || "Russian";
-      localStorage.setItem(STORAGE_KEYS.source, target);
-      localStorage.setItem(STORAGE_KEYS.target, detected);
-    } else {
-      localStorage.setItem(STORAGE_KEYS.source, target);
-      localStorage.setItem(STORAGE_KEYS.target, source);
+  async function translateTabIfEnabled(tab) {
+    if (!getStoredEnabled(tab)) {
+      return;
     }
-    broadcastSettings();
+    const targetTab = tab || detectActiveTab();
+    await translateTabPrompt(targetTab, {
+      silent: true,
+      suppressInputEvent: true,
+      useRememberedSource: true,
+    });
+  }
 
-    if (getStoredEnabled()) {
-      const activeTab = detectActiveTab();
-      await translateTabPrompt(activeTab, {
-        silent: true,
-        suppressInputEvent: true,
-        useRememberedSource: true,
-      });
+  async function swapLanguages(preferredTab) {
+    const targetTab = preferredTab || detectActiveTab();
+    const source = getStoredSource(targetTab);
+    const target = getStoredTarget(targetTab);
+    if (source === "Auto Detect") {
+      const detected = getLastDetectedSource(targetTab) || "Russian";
+      setStoredSource(targetTab, target);
+      setStoredTarget(targetTab, detected);
+    } else {
+      setStoredSource(targetTab, target);
+      setStoredTarget(targetTab, source);
     }
+    broadcastSettings(targetTab);
+
+    await translateTabIfEnabled(targetTab);
   }
 
   function applyPromptValue(textarea, value, options = {}) {
@@ -253,10 +301,10 @@
       return false;
     }
 
-    const source = getStoredSource();
-    const target = getStoredTarget();
+    const source = getStoredSource(tab);
+    const target = getStoredTarget(tab);
     const currentText = promptArea.value || "";
-    const rememberedDetectedSource = getLastDetectedSource();
+    const rememberedDetectedSource = getLastDetectedSource(tab);
     const useRememberedSource =
       source === "Auto Detect" &&
       options &&
@@ -276,7 +324,7 @@
     }
     try {
       const result = await callTranslateApi(currentText, effectiveSource, target);
-      setLastTarget(target);
+      setLastTarget(tab, target);
       let detectedSource = "";
       if (result && typeof result.detected_source === "string" && result.detected_source) {
         detectedSource = result.detected_source;
@@ -297,7 +345,7 @@
         detectedSource = rememberedDetectedSource;
       }
       if (detectedSource) {
-        setLastDetectedSource(detectedSource);
+        setLastDetectedSource(tab, detectedSource);
       }
       if ((promptArea.value || "") !== currentText) {
         // User kept typing while request was in flight; drop stale result.
@@ -357,7 +405,7 @@
       return;
     }
 
-    if (!getStoredEnabled()) {
+    if (!getStoredEnabled(tab)) {
       return;
     }
 
@@ -436,7 +484,7 @@
 
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
-    checkbox.checked = getStoredEnabled();
+    checkbox.checked = getStoredEnabled(tab);
 
     const checkboxText = document.createElement("span");
     checkboxText.textContent = "Auto Translate";
@@ -447,7 +495,7 @@
     const fromLabel = document.createElement("span");
     fromLabel.textContent = "From";
 
-    const fromSelect = createLanguageSelect(getStoredSource(), FROM_LANGUAGES);
+    const fromSelect = createLanguageSelect(getStoredSource(tab), FROM_LANGUAGES);
 
     const swapButton = document.createElement("button");
     swapButton.type = "button";
@@ -469,7 +517,7 @@
     const toLabel = document.createElement("span");
     toLabel.textContent = "To";
 
-    const toSelect = createLanguageSelect(getStoredTarget(), TO_LANGUAGES);
+    const toSelect = createLanguageSelect(getStoredTarget(tab), TO_LANGUAGES);
 
     const hint = document.createElement("span");
     hint.textContent = "Alt+Q: translate | Alt+W: swap";
@@ -492,8 +540,8 @@
     }
 
     checkbox.addEventListener("change", async () => {
-      localStorage.setItem(STORAGE_KEYS.enabled, checkbox.checked ? "1" : "0");
-      broadcastSettings();
+      setStoredEnabled(tab, checkbox.checked);
+      broadcastSettings(tab);
 
       if (checkbox.checked) {
         await translateTabPrompt(tab, {
@@ -504,17 +552,19 @@
       }
     });
 
-    fromSelect.addEventListener("change", () => {
-      localStorage.setItem(STORAGE_KEYS.source, fromSelect.value);
-      broadcastSettings();
+    fromSelect.addEventListener("change", async () => {
+      setStoredSource(tab, fromSelect.value);
+      broadcastSettings(tab);
+      await translateTabIfEnabled(tab);
     });
 
-    toSelect.addEventListener("change", () => {
-      localStorage.setItem(STORAGE_KEYS.target, toSelect.value);
-      broadcastSettings();
+    toSelect.addEventListener("change", async () => {
+      setStoredTarget(tab, toSelect.value);
+      broadcastSettings(tab);
+      await translateTabIfEnabled(tab);
     });
 
-    swapButton.addEventListener("click", swapLanguages);
+    swapButton.addEventListener("click", () => swapLanguages(tab));
 
     state.rows.set(tab.name, {
       row,
@@ -540,7 +590,7 @@
           return;
         }
 
-        if (!getStoredEnabled()) {
+        if (!getStoredEnabled(tab)) {
           return;
         }
 
@@ -600,12 +650,14 @@
 
   function boot() {
     // Keep extension active in UI, and reset controls to defaults on each UI load.
-    localStorage.setItem(STORAGE_KEYS.enabled, "0");
-    localStorage.setItem(STORAGE_KEYS.source, "Auto Detect");
-    localStorage.setItem(STORAGE_KEYS.target, "English");
-    localStorage.removeItem(STORAGE_KEYS.lastDetectedSource);
-    if (!localStorage.getItem(STORAGE_KEYS.lastTarget)) {
-      localStorage.setItem(STORAGE_KEYS.lastTarget, "English");
+    for (const tab of TABS) {
+      setStoredEnabled(tab, false);
+      setStoredSource(tab, "Auto Detect");
+      setStoredTarget(tab, "English");
+      localStorage.removeItem(tabStorageKey(STORAGE_KEYS.lastDetectedSource, tab));
+      if (!localStorage.getItem(tabStorageKey(STORAGE_KEYS.lastTarget, tab))) {
+        setLastTarget(tab, "English");
+      }
     }
 
     initializeUi();
