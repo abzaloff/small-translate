@@ -533,10 +533,10 @@
     row.appendChild(toSelect);
     row.appendChild(hint);
 
-    if (negativeHost && negativeHost.parentElement) {
+    if (promptHost && promptHost.parentElement) {
+      promptHost.insertAdjacentElement("beforebegin", row);
+    } else if (negativeHost && negativeHost.parentElement) {
       negativeHost.insertAdjacentElement("beforebegin", row);
-    } else if (promptHost && promptHost.parentElement) {
-      promptHost.insertAdjacentElement("afterend", row);
     }
 
     checkbox.addEventListener("change", async () => {
