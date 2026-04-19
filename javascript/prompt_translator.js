@@ -519,6 +519,27 @@
 
     const toSelect = createLanguageSelect(getStoredTarget(tab), TO_LANGUAGES);
 
+    const translateButton = document.createElement("button");
+    translateButton.type = "button";
+    translateButton.textContent = "Translate";
+    translateButton.style.height = "var(--input-height)";
+    translateButton.style.minHeight = "var(--input-height)";
+    translateButton.style.padding = "0 12px";
+    translateButton.style.boxSizing = "border-box";
+    translateButton.style.display = "inline-flex";
+    translateButton.style.alignItems = "center";
+    translateButton.style.justifyContent = "center";
+    translateButton.style.borderStyle = "solid";
+    translateButton.style.borderWidth = "1px";
+    translateButton.style.border = "1px solid #F87215";
+    translateButton.style.borderRadius = "var(--radius-lg, 10px)";
+    translateButton.style.background = "#F87215";
+    translateButton.style.color = "#ffffff";
+    translateButton.style.cursor = "pointer";
+    translateButton.style.fontSize = "0.95em";
+    translateButton.style.fontWeight = "600";
+    translateButton.style.whiteSpace = "nowrap";
+
     const hint = document.createElement("span");
     hint.textContent = "Alt+Q: translate | Alt+W: swap";
     hint.style.opacity = "0.8";
@@ -531,6 +552,7 @@
     row.appendChild(swapButton);
     row.appendChild(toLabel);
     row.appendChild(toSelect);
+    row.appendChild(translateButton);
     row.appendChild(hint);
 
     if (promptHost && promptHost.parentElement) {
@@ -565,6 +587,9 @@
     });
 
     swapButton.addEventListener("click", () => swapLanguages(tab));
+    translateButton.addEventListener("click", async () => {
+      await translateTabPrompt(tab, { silent: false });
+    });
 
     state.rows.set(tab.name, {
       row,
