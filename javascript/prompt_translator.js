@@ -522,6 +522,10 @@
     const translateButton = document.createElement("button");
     translateButton.type = "button";
     translateButton.textContent = "Translate";
+    const templatePrimaryButton = findFirst(tab.generateSelectors);
+    if (templatePrimaryButton) {
+      translateButton.className = templatePrimaryButton.className;
+    }
     translateButton.style.height = "var(--input-height)";
     translateButton.style.minHeight = "var(--input-height)";
     translateButton.style.padding = "0 12px";
@@ -529,15 +533,9 @@
     translateButton.style.display = "inline-flex";
     translateButton.style.alignItems = "center";
     translateButton.style.justifyContent = "center";
-    translateButton.style.borderStyle = "solid";
-    translateButton.style.borderWidth = "1px";
-    translateButton.style.border = "1px solid #F87215";
     translateButton.style.borderRadius = "var(--radius-lg, 10px)";
-    translateButton.style.background = "#F87215";
-    translateButton.style.color = "#ffffff";
     translateButton.style.cursor = "pointer";
     translateButton.style.fontSize = "0.95em";
-    translateButton.style.fontWeight = "600";
     translateButton.style.whiteSpace = "nowrap";
 
     const hint = document.createElement("span");
