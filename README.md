@@ -82,4 +82,4 @@ In Auto Translate mode, detected source language is remembered during the sessio
 
 ## License
 
-Add your preferred license here (for example, MIT).
+See [LICENSE.md](./LICENSE.md).
