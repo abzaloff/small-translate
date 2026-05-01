@@ -22,6 +22,7 @@
   const FROM_LANGUAGES = ["Auto Detect", ...BASE_LANGUAGES];
   const TO_LANGUAGES = [...BASE_LANGUAGES];
   const LIVE_TRANSLATE_DEBOUNCE_MS = 900;
+  const VOICE_RESTART_DELAY_MS = 1400;
 
   const TABS = [
     {
@@ -43,6 +44,7 @@
   const state = {
     rows: new Map(),
     liveTranslateTimers: new Map(),
+    voiceSessions: new Map(),
     isInitialized: false,
   };
 
@@ -439,6 +441,189 @@
     });
   }
 
+  function getSpeechRecognitionCtor() {
+    return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  }
+
+  function stopVoiceInput(tabName) {
+    const session = state.voiceSessions.get(tabName);
+    if (!session) {
+      return;
+    }
+    session.keepListening = false;
+    session.manualStop = true;
+    if (session.restartTimer) {
+      clearTimeout(session.restartTimer);
+      session.restartTimer = null;
+    }
+    if (!session.recognition) {
+      finalizeVoiceSession(tabName, session);
+      return;
+    }
+    try {
+      session.recognition.stop();
+    } catch (error) {
+      // Ignore stop() errors from stale recognizers.
+    }
+  }
+
+  function speechLocaleForLanguage(languageName) {
+    const normalized = (languageName || "").toLowerCase();
+    if (normalized === "russian") return "ru-RU";
+    if (normalized === "english") return "en-US";
+    if (normalized === "chinese") return "zh-CN";
+    if (normalized === "japanese") return "ja-JP";
+    if (normalized === "korean") return "ko-KR";
+    if (normalized === "german") return "de-DE";
+    if (normalized === "french") return "fr-FR";
+    if (normalized === "spanish") return "es-ES";
+    if (normalized === "italian") return "it-IT";
+    if (normalized === "portuguese") return "pt-PT";
+    return (navigator && navigator.language) || "en-US";
+  }
+
+  function updateVoicePreview(session, interimTranscript) {
+    const spokenText = (session.finalTranscript + (interimTranscript || "")).trim();
+    session.latestPreview = spokenText
+      ? session.baseText + session.baseSuffix + spokenText
+      : session.baseText;
+    session.promptArea.value = session.latestPreview;
+  }
+
+  function appendVoiceChunk(currentText, chunk) {
+    const normalizedChunk = typeof chunk === "string" ? chunk.trim() : "";
+    if (!normalizedChunk) {
+      return currentText || "";
+    }
+    const base = currentText || "";
+    if (!base) {
+      return normalizedChunk;
+    }
+    if (/\s$/.test(base)) {
+      return base + normalizedChunk;
+    }
+    return base + " " + normalizedChunk;
+  }
+
+  function finalizeVoiceSession(tabName, session) {
+    if (session.restartTimer) {
+      clearTimeout(session.restartTimer);
+      session.restartTimer = null;
+    }
+    state.voiceSessions.delete(tabName);
+    session.micButton.textContent = session.defaultLabel;
+    session.micButton.title = "Voice input";
+    if (session.latestPreview !== session.baseText) {
+      applyPromptValue(session.promptArea, session.latestPreview);
+    }
+  }
+
+  function attachRecognitionHandlers(tab, session, recognition) {
+    recognition.onresult = (event) => {
+      let interimTranscript = "";
+      for (let i = event.resultIndex; i < event.results.length; i += 1) {
+        const result = event.results[i];
+        const chunk = result && result[0] && result[0].transcript ? result[0].transcript : "";
+        if (!chunk) {
+          continue;
+        }
+        if (result.isFinal) {
+          session.finalTranscript = appendVoiceChunk(session.finalTranscript, chunk);
+        } else {
+          interimTranscript = appendVoiceChunk(interimTranscript, chunk);
+        }
+      }
+      updateVoicePreview(session, interimTranscript);
+    };
+
+    recognition.onerror = (event) => {
+      if (event && event.error && event.error !== "no-speech" && event.error !== "aborted") {
+        console.warn("[prompt-translator] voice input error:", event.error);
+      }
+    };
+
+    recognition.onend = () => {
+      session.recognition = null;
+      if (!session.keepListening) {
+        finalizeVoiceSession(tab.name, session);
+        return;
+      }
+      session.restartTimer = window.setTimeout(() => {
+        if (!session.keepListening || state.voiceSessions.get(tab.name) !== session) {
+          return;
+        }
+        const SpeechRecognitionCtor = getSpeechRecognitionCtor();
+        if (!SpeechRecognitionCtor) {
+          finalizeVoiceSession(tab.name, session);
+          return;
+        }
+        const nextRecognition = new SpeechRecognitionCtor();
+        nextRecognition.lang = speechLocaleForLanguage(getStoredSource(tab));
+        nextRecognition.interimResults = true;
+        nextRecognition.continuous = false;
+        nextRecognition.maxAlternatives = 1;
+        session.recognition = nextRecognition;
+        session.restartTimer = null;
+        attachRecognitionHandlers(tab, session, nextRecognition);
+        try {
+          nextRecognition.start();
+        } catch (error) {
+          console.warn("[prompt-translator] voice input restart failed:", error);
+          finalizeVoiceSession(tab.name, session);
+        }
+      }, VOICE_RESTART_DELAY_MS);
+    };
+  }
+
+  function startVoiceInput(tab, micButton) {
+    const SpeechRecognitionCtor = getSpeechRecognitionCtor();
+    if (!SpeechRecognitionCtor) {
+      console.warn("[prompt-translator] SpeechRecognition is not supported in this browser");
+      return;
+    }
+
+    const existingSession = state.voiceSessions.get(tab.name);
+    if (existingSession) {
+      stopVoiceInput(tab.name);
+      return;
+    }
+
+    const promptArea = findFirst(tab.promptSelectors);
+    if (!promptArea) {
+      console.warn("[prompt-translator] prompt area not found for voice input:", tab.name);
+      return;
+    }
+
+    const recognition = new SpeechRecognitionCtor();
+    recognition.lang = speechLocaleForLanguage(getStoredSource(tab));
+    recognition.interimResults = true;
+    recognition.continuous = false;
+    recognition.maxAlternatives = 1;
+
+    const defaultLabel = micButton.dataset.ptDefaultLabel || "🎤";
+    micButton.textContent = "■";
+    micButton.title = "Stop voice input";
+
+    const baseText = promptArea.value || "";
+    const session = {
+      recognition,
+      keepListening: true,
+      manualStop: false,
+      restartTimer: null,
+      baseText,
+      baseSuffix: baseText && !/\s$/.test(baseText) ? " " : "",
+      finalTranscript: "",
+      latestPreview: baseText,
+      promptArea,
+      micButton,
+      defaultLabel,
+    };
+
+    state.voiceSessions.set(tab.name, session);
+    attachRecognitionHandlers(tab, session, recognition);
+    recognition.start();
+  }
+
   function mountTranslatorRow(tab) {
     if (state.rows.has(tab.name)) {
       const current = state.rows.get(tab.name);
@@ -538,6 +723,32 @@
     translateButton.style.fontSize = "0.95em";
     translateButton.style.whiteSpace = "nowrap";
 
+    const micButton = document.createElement("button");
+    micButton.type = "button";
+    micButton.textContent = "🎤";
+    micButton.dataset.ptDefaultLabel = "🎤";
+    micButton.title = "Voice input";
+    const templateSecondaryButton = swapButton;
+    if (templateSecondaryButton) {
+      micButton.className = templateSecondaryButton.className;
+    }
+    micButton.style.minWidth = "36px";
+    micButton.style.width = "36px";
+    micButton.style.height = "var(--input-height)";
+    micButton.style.display = "inline-flex";
+    micButton.style.alignItems = "center";
+    micButton.style.justifyContent = "center";
+    micButton.style.padding = "0";
+    micButton.style.borderRadius = "var(--radius-lg, 10px)";
+    micButton.style.cursor = "pointer";
+    micButton.style.lineHeight = "1";
+    if (!getSpeechRecognitionCtor()) {
+      micButton.disabled = true;
+      micButton.title = "Voice input is not supported in this browser";
+      micButton.style.opacity = "0.6";
+      micButton.style.cursor = "not-allowed";
+    }
+
     const hint = document.createElement("span");
     hint.textContent = "Alt+Q: translate | Alt+W: swap";
     hint.style.opacity = "0.8";
@@ -551,6 +762,7 @@
     row.appendChild(toLabel);
     row.appendChild(toSelect);
     row.appendChild(translateButton);
+    row.appendChild(micButton);
     row.appendChild(hint);
 
     if (promptHost && promptHost.parentElement) {
@@ -587,6 +799,9 @@
     swapButton.addEventListener("click", () => swapLanguages(tab));
     translateButton.addEventListener("click", async () => {
       await translateTabPrompt(tab, { silent: false });
+    });
+    micButton.addEventListener("click", () => {
+      startVoiceInput(tab, micButton);
     });
 
     state.rows.set(tab.name, {
