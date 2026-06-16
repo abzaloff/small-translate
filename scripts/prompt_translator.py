@@ -1,3 +1,4 @@
+import concurrent.futures
 import threading
 from typing import Dict, Tuple
 
@@ -52,7 +53,7 @@ _cache_lock = threading.Lock()
 
 class TranslateRequest(BaseModel):
     text: str = Field(default="")
-    source: str = Field(default="Auto Detect")
+    source: str = Field(default="Russian")
     target: str = Field(default="English")
 
 
@@ -112,7 +113,13 @@ def _translate_text(text: str, source_name: str, target_name: str) -> TranslateR
         )
 
     try:
-        translated = GoogleTranslator(source=source_code, target=target_code).translate(text)
+        def _do_translate():
+            return GoogleTranslator(source=source_code, target=target_code).translate(text)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_do_translate)
+            translated = future.result(timeout=5)
+
         if translated is None:
             translated = text
 
@@ -140,7 +147,9 @@ def _register_routes(_: object, app: FastAPI) -> None:
         return _translate_text(payload.text, payload.source, payload.target)
 
     @app.post("/sdapi/v1/prompt-translator/translate", response_model=TranslateResponse)
-    def prompt_translator_translate_sdapi(payload: TranslateRequest) -> TranslateResponse:
+    def prompt_translator_translate_sdapi(
+        payload: TranslateRequest,
+    ) -> TranslateResponse:
         return _translate_text(payload.text, payload.source, payload.target)
 
 
