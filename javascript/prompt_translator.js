@@ -202,6 +202,46 @@
     return select;
   }
 
+  function createPromptIconButton(label, title) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.title = title;
+    button.style.minWidth = "36px";
+    button.style.width = "36px";
+    button.style.height = "var(--input-height)";
+    button.style.minHeight = "var(--input-height)";
+    button.style.boxSizing = "border-box";
+    button.style.display = "inline-flex";
+    button.style.alignItems = "center";
+    button.style.justifyContent = "center";
+    button.style.padding = "0";
+    button.style.border = "1px solid var(--button-secondary-border-color, var(--border-color-primary))";
+    button.style.borderRadius = "var(--radius-lg, 10px)";
+    button.style.background = "var(--button-secondary-background-fill, var(--input-background-fill))";
+    button.style.color = "var(--button-secondary-text-color, var(--body-text-color))";
+    button.style.cursor = "pointer";
+    button.style.textDecoration = "none";
+    button.style.lineHeight = "1";
+    button.style.fontSize = "1em";
+    return button;
+  }
+
+  function syncIconButtonHeight(referenceControls, iconButtons) {
+    const heights = referenceControls
+      .map((control) => (control ? control.getBoundingClientRect().height : 0))
+      .filter((height) => height > 0);
+    if (!heights.length) {
+      return;
+    }
+
+    const height = Math.max(...heights);
+    for (const button of iconButtons) {
+      button.style.height = height + "px";
+      button.style.minHeight = height + "px";
+    }
+  }
+
   function broadcastSettings(preferredTab) {
     for (const [tabName, row] of state.rows.entries()) {
       if (preferredTab && tabName !== resolveTabName(preferredTab)) {
@@ -252,6 +292,45 @@
     textarea.value = value;
     textarea.dispatchEvent(new Event("input", { bubbles: true }));
     textarea.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  async function pasteClipboardIntoPrompt(tab) {
+    const promptArea = findFirst(tab.promptSelectors);
+    if (!promptArea) {
+      console.warn("[prompt-translator] prompt area not found for", tab.name);
+      return false;
+    }
+    if (!navigator.clipboard || typeof navigator.clipboard.readText !== "function") {
+      console.warn("[prompt-translator] clipboard read is not available in this browser");
+      return false;
+    }
+
+    const clipboardText = await navigator.clipboard.readText();
+    const currentText = promptArea.value || "";
+    const start =
+      typeof promptArea.selectionStart === "number" ? promptArea.selectionStart : currentText.length;
+    const end =
+      typeof promptArea.selectionEnd === "number" ? promptArea.selectionEnd : currentText.length;
+    const nextText = currentText.slice(0, start) + clipboardText + currentText.slice(end);
+    const nextCursor = start + clipboardText.length;
+
+    applyPromptValue(promptArea, nextText);
+    promptArea.focus();
+    if (typeof promptArea.setSelectionRange === "function") {
+      promptArea.setSelectionRange(nextCursor, nextCursor);
+    }
+    return true;
+  }
+
+  function clearPrompt(tab) {
+    const promptArea = findFirst(tab.promptSelectors);
+    if (!promptArea) {
+      console.warn("[prompt-translator] prompt area not found for", tab.name);
+      return false;
+    }
+    applyPromptValue(promptArea, "");
+    promptArea.focus();
+    return true;
   }
 
   function preserveBoundaryWhitespace(originalText, translatedText) {
@@ -672,32 +751,20 @@
     checkbox.checked = getStoredEnabled(tab);
 
     const checkboxText = document.createElement("span");
-    checkboxText.textContent = "Auto Translate";
+    checkboxText.textContent = "Auto";
 
     label.appendChild(checkbox);
     label.appendChild(checkboxText);
+
+    const pasteButton = createPromptIconButton("↓", "Paste");
+    const clearButton = createPromptIconButton("×", "Clear");
 
     const fromLabel = document.createElement("span");
     fromLabel.textContent = "From";
 
     const fromSelect = createLanguageSelect(getStoredSource(tab), FROM_LANGUAGES);
 
-    const swapButton = document.createElement("button");
-    swapButton.type = "button";
-    swapButton.style.minWidth = "36px";
-    swapButton.style.width = "36px";
-    swapButton.style.height = "var(--input-height)";
-    swapButton.style.display = "inline-flex";
-    swapButton.style.alignItems = "center";
-    swapButton.style.justifyContent = "center";
-    swapButton.style.padding = "0";
-    swapButton.style.border = "1px solid var(--button-secondary-border-color, var(--border-color-primary))";
-    swapButton.style.borderRadius = "var(--radius-lg, 10px)";
-    swapButton.style.background = "var(--button-secondary-background-fill, var(--input-background-fill))";
-    swapButton.style.color = "var(--button-secondary-text-color, var(--body-text-color))";
-    swapButton.style.cursor = "pointer";
-    swapButton.style.textDecoration = "none";
-    swapButton.textContent = "↔";
+    const swapButton = createPromptIconButton("↔", "Swap");
 
     const toLabel = document.createElement("span");
     toLabel.textContent = "To";
@@ -756,6 +823,8 @@
     hint.style.fontSize = "0.9em";
 
     row.appendChild(label);
+    row.appendChild(pasteButton);
+    row.appendChild(clearButton);
     row.appendChild(fromLabel);
     row.appendChild(fromSelect);
     row.appendChild(swapButton);
@@ -770,6 +839,14 @@
     } else if (negativeHost && negativeHost.parentElement) {
       negativeHost.insertAdjacentElement("beforebegin", row);
     }
+
+    requestAnimationFrame(() => {
+      syncIconButtonHeight([fromSelect, toSelect, translateButton], [
+        pasteButton,
+        clearButton,
+        swapButton,
+      ]);
+    });
 
     checkbox.addEventListener("change", async () => {
       setStoredEnabled(tab, checkbox.checked);
@@ -797,6 +874,14 @@
     });
 
     swapButton.addEventListener("click", () => swapLanguages(tab));
+    pasteButton.addEventListener("click", async () => {
+      try {
+        await pasteClipboardIntoPrompt(tab);
+      } catch (error) {
+        console.warn("[prompt-translator] failed to paste clipboard text", error);
+      }
+    });
+    clearButton.addEventListener("click", () => clearPrompt(tab));
     translateButton.addEventListener("click", async () => {
       await translateTabPrompt(tab, { silent: false });
     });
