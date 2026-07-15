@@ -232,7 +232,7 @@
       .map((control) => (control ? control.getBoundingClientRect().height : 0))
       .filter((height) => height > 0);
     if (!heights.length) {
-      return;
+      return false;
     }
 
     const height = Math.max(...heights);
@@ -240,6 +240,30 @@
       button.style.height = height + "px";
       button.style.minHeight = height + "px";
     }
+    return true;
+  }
+
+  function syncRowIconButtonHeight(rowState) {
+    if (!rowState || !rowState.row || !rowState.row.isConnected || !isVisible(rowState.row)) {
+      return false;
+    }
+    return syncIconButtonHeight(
+      [rowState.fromSelect, rowState.toSelect, rowState.translateButton],
+      rowState.iconButtons || [],
+    );
+  }
+
+  function syncAllIconButtonHeights() {
+    for (const rowState of state.rows.values()) {
+      syncRowIconButtonHeight(rowState);
+    }
+  }
+
+  function scheduleRowIconButtonHeightSync(rowState) {
+    const sync = () => syncRowIconButtonHeight(rowState);
+    requestAnimationFrame(sync);
+    window.setTimeout(sync, 60);
+    window.setTimeout(sync, 250);
   }
 
   function broadcastSettings(preferredTab) {
@@ -840,14 +864,6 @@
       negativeHost.insertAdjacentElement("beforebegin", row);
     }
 
-    requestAnimationFrame(() => {
-      syncIconButtonHeight([fromSelect, toSelect, translateButton], [
-        pasteButton,
-        clearButton,
-        swapButton,
-      ]);
-    });
-
     checkbox.addEventListener("change", async () => {
       setStoredEnabled(tab, checkbox.checked);
       broadcastSettings(tab);
@@ -894,7 +910,10 @@
       checkbox,
       fromSelect,
       toSelect,
+      translateButton,
+      iconButtons: [pasteButton, clearButton, swapButton],
     });
+    scheduleRowIconButtonHeightSync(state.rows.get(tab.name));
   }
 
   function hookGenerateButton(tab) {
@@ -937,6 +956,7 @@
     }
 
     broadcastSettings();
+    requestAnimationFrame(syncAllIconButtonHeights);
   }
 
   function hookHotkey() {
@@ -991,6 +1011,14 @@
     }
 
     state.isInitialized = true;
+    document.addEventListener(
+      "click",
+      () => {
+        requestAnimationFrame(syncAllIconButtonHeights);
+      },
+      true,
+    );
+
     const observer = new MutationObserver(() => {
       initializeUi();
     });
