@@ -1,10 +1,11 @@
 import threading
 from typing import Dict, Tuple
 
+import gradio as gr
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-from modules import script_callbacks
+from modules import script_callbacks, shared
 
 try:
     from deep_translator import GoogleTranslator
@@ -135,6 +136,24 @@ def _translate_text(text: str, source_name: str, target_name: str) -> TranslateR
 
 
 def _register_routes(_: object, app: FastAPI) -> None:
+    def prompt_translator_settings_payload() -> Dict[str, str]:
+        options_data = getattr(shared.opts, "data", {})
+        if not isinstance(options_data, dict):
+            options_data = {}
+        value = options_data.get(
+            "prompt_translator_default_source_language",
+            "Auto Detect",
+        )
+        return {"default_source_language": _normalize_language(value, "Auto Detect")}
+
+    @app.get("/prompt-translator/settings")
+    def prompt_translator_settings() -> Dict[str, str]:
+        return prompt_translator_settings_payload()
+
+    @app.get("/sdapi/v1/prompt-translator/settings")
+    def prompt_translator_settings_sdapi() -> Dict[str, str]:
+        return prompt_translator_settings_payload()
+
     @app.post("/prompt-translator/translate", response_model=TranslateResponse)
     def prompt_translator_translate(payload: TranslateRequest) -> TranslateResponse:
         return _translate_text(payload.text, payload.source, payload.target)
@@ -144,4 +163,19 @@ def _register_routes(_: object, app: FastAPI) -> None:
         return _translate_text(payload.text, payload.source, payload.target)
 
 
+def _register_settings() -> None:
+    section = ("prompt_translator", "Prompt Translator")
+    shared.opts.add_option(
+        "prompt_translator_default_source_language",
+        shared.OptionInfo(
+            "Auto Detect",
+            "Default source language",
+            gr.Dropdown,
+            {"choices": list(LANGUAGE_CODES.keys())},
+            section=section,
+        ),
+    )
+
+
 script_callbacks.on_app_started(_register_routes)
+script_callbacks.on_ui_settings(_register_settings)

@@ -99,6 +99,69 @@
     return FROM_LANGUAGES.includes(value) ? value : "Auto Detect";
   }
 
+  function normalizeSourceLanguage(value) {
+    return FROM_LANGUAGES.includes(value) ? value : "";
+  }
+
+  function readDefaultSourceLanguageFromOptions(options) {
+    if (!options || typeof options !== "object") {
+      return "";
+    }
+    const optionData =
+      options.data && typeof options.data === "object" ? options.data : options;
+    return normalizeSourceLanguage(optionData.prompt_translator_default_source_language);
+  }
+
+  function getDefaultSourceLanguageFromPageOptions() {
+    const candidates = [];
+    if (typeof window !== "undefined" && window.opts && typeof window.opts === "object") {
+      candidates.push(window.opts);
+    }
+    if (typeof opts !== "undefined" && opts && typeof opts === "object") {
+      candidates.push(opts);
+    }
+    for (const candidate of candidates) {
+      const value = readDefaultSourceLanguageFromOptions(candidate);
+      if (value) {
+        return value;
+      }
+    }
+    return "";
+  }
+
+  async function fetchDefaultSourceLanguage() {
+    const endpoints = [
+      "/prompt-translator/settings",
+      "/sdapi/v1/prompt-translator/settings",
+    ];
+    for (const endpoint of endpoints) {
+      try {
+        const response = await fetch(endpoint, { method: "GET" });
+        if (!response.ok) {
+          continue;
+        }
+        const data = await response.json();
+        const value = normalizeSourceLanguage(
+          data.default_source_language || data.prompt_translator_default_source_language,
+        );
+        if (value) {
+          return value;
+        }
+      } catch (error) {
+        // Try the next endpoint; Forge builds expose extension routes differently.
+      }
+    }
+    return "";
+  }
+
+  async function getDefaultSourceLanguage() {
+    return (
+      getDefaultSourceLanguageFromPageOptions() ||
+      (await fetchDefaultSourceLanguage()) ||
+      "Auto Detect"
+    );
+  }
+
   function setStoredSource(tabOrName, value) {
     localStorage.setItem(tabStorageKey(STORAGE_KEYS.source, tabOrName), value);
   }
@@ -991,11 +1054,12 @@
     });
   }
 
-  function boot() {
+  async function boot() {
     // Keep extension active in UI, and reset controls to defaults on each UI load.
+    const defaultSourceLanguage = await getDefaultSourceLanguage();
     for (const tab of TABS) {
       setStoredEnabled(tab, false);
-      setStoredSource(tab, "Auto Detect");
+      setStoredSource(tab, defaultSourceLanguage);
       setStoredTarget(tab, "English");
       localStorage.removeItem(tabStorageKey(STORAGE_KEYS.lastDetectedSource, tab));
       if (!localStorage.getItem(tabStorageKey(STORAGE_KEYS.lastTarget, tab))) {

@@ -9,6 +9,7 @@ Translate your **positive prompt** inside Forge NEO / A1111 WebUI with one key p
 - Works in both `txt2img` and `img2img`
 - Adds a compact translator row near prompt fields
 - `From` language supports `Auto Detect`
+- Configurable default `From` language in Forge settings
 - `To` language defaults to `English`
 - `Alt+Q` translates current positive prompt instantly
 - `Alt+W` swaps `From` and `To`
@@ -62,7 +63,7 @@ Alternative (recommended for GitHub users):
 
 Default state on each Forge UI load:
 - `Auto Translate`: OFF
-- `From`: Auto Detect
+- `From`: Forge setting `Prompt Translator -> Default source language` (`Auto Detect` by default)
 - `To`: English
 
 Typical flow:
