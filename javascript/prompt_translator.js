@@ -244,7 +244,9 @@
     if (templateSelect) {
       select.className = templateSelect.className;
     }
-    select.style.minWidth = "120px";
+    select.style.minWidth = "100px";
+    select.style.width = "100px";
+    select.style.maxWidth = "100px";
     select.style.height = "var(--input-height)";
     select.style.background = "var(--input-background-fill)";
     select.style.color = "var(--body-text-color)";
@@ -270,8 +272,9 @@
     button.type = "button";
     button.textContent = label;
     button.title = title;
-    button.style.minWidth = "36px";
-    button.style.width = "36px";
+    button.style.minWidth = "30px";
+    button.style.width = "30px";
+    button.style.maxWidth = "30px";
     button.style.height = "var(--input-height)";
     button.style.minHeight = "var(--input-height)";
     button.style.boxSizing = "border-box";
@@ -406,6 +409,21 @@
     if (typeof promptArea.setSelectionRange === "function") {
       promptArea.setSelectionRange(nextCursor, nextCursor);
     }
+    return true;
+  }
+
+  async function copyPromptToClipboard(tab) {
+    const promptArea = findFirst(tab.promptSelectors);
+    if (!promptArea) {
+      console.warn("[prompt-translator] prompt area not found for", tab.name);
+      return false;
+    }
+    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+      console.warn("[prompt-translator] clipboard write is not available in this browser");
+      return false;
+    }
+
+    await navigator.clipboard.writeText(promptArea.value || "");
     return true;
   }
 
@@ -843,6 +861,7 @@
     label.appendChild(checkbox);
     label.appendChild(checkboxText);
 
+    const copyButton = createPromptIconButton("⧉", "Copy");
     const pasteButton = createPromptIconButton("↓", "Paste");
     const clearButton = createPromptIconButton("×", "Clear");
 
@@ -910,6 +929,7 @@
     hint.style.fontSize = "0.9em";
 
     row.appendChild(label);
+    row.appendChild(copyButton);
     row.appendChild(pasteButton);
     row.appendChild(clearButton);
     row.appendChild(fromLabel);
@@ -953,6 +973,13 @@
     });
 
     swapButton.addEventListener("click", () => swapLanguages(tab));
+    copyButton.addEventListener("click", async () => {
+      try {
+        await copyPromptToClipboard(tab);
+      } catch (error) {
+        console.warn("[prompt-translator] failed to copy prompt text", error);
+      }
+    });
     pasteButton.addEventListener("click", async () => {
       try {
         await pasteClipboardIntoPrompt(tab);
@@ -974,7 +1001,7 @@
       fromSelect,
       toSelect,
       translateButton,
-      iconButtons: [pasteButton, clearButton, swapButton],
+      iconButtons: [copyButton, pasteButton, clearButton, swapButton],
     });
     scheduleRowIconButtonHeightSync(state.rows.get(tab.name));
   }
