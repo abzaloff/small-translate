@@ -9,7 +9,7 @@ Translate your **positive prompt** inside Forge NEO / A1111 WebUI with one key p
 - Works in both `txt2img` and `img2img`
 - Adds a compact translator row near prompt fields
 - `From` language supports `Auto Detect`
-- Configurable default `From` language in Forge settings
+- Configurable interface languages and default `From` language in Forge settings
 - `To` language defaults to `English`
 - `Alt+Q` translates current positive prompt instantly
 - `Alt+W` swaps `From` and `To`
@@ -20,17 +20,14 @@ Translate your **positive prompt** inside Forge NEO / A1111 WebUI with one key p
 
 ## Supported Languages
 
-- Auto Detect (From only)
-- Russian
-- English
-- Chinese
-- Japanese
-- Korean
-- German
-- French
-- Spanish
-- Italian
-- Portuguese
+The Google translator backend exposes 133 language variants. Choose any number of
+them under `Settings -> Prompt Translator -> Languages shown in the translator
+interface`. The ten languages enabled by default are Russian, English, Chinese,
+Japanese, Korean, German, French, Spanish, Italian, and Portuguese.
+
+`Default source language` can independently use any supported language or
+`Auto Detect`. A default source language that is not in the interface selection
+is still added to the `From` list so that the configured default remains usable.
 
 ## Project Structure
 
@@ -64,7 +61,7 @@ Alternative (recommended for GitHub users):
 Default state on each Forge UI load:
 - `Auto Translate`: OFF
 - `From`: Forge setting `Prompt Translator -> Default source language` (`Auto Detect` by default)
-- `To`: English
+- `To`: English when enabled, otherwise the first selected interface language
 
 Typical flow:
 1. Type prompt in your language.

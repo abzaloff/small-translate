@@ -1,5 +1,5 @@
 import threading
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import gradio as gr
 from fastapi import FastAPI
@@ -19,33 +19,65 @@ except Exception:  # pragma: no cover
     detect = None
 
 
+DEFAULT_ENABLED_LANGUAGES = [
+    "Russian",
+    "English",
+    "Chinese",
+    "Japanese",
+    "Korean",
+    "German",
+    "French",
+    "Spanish",
+    "Italian",
+    "Portuguese",
+]
+
+
+def _display_language_name(language_name: str) -> str:
+    if language_name == "chinese (simplified)":
+        return "Chinese"
+    return language_name.title()
+
+
+def _supported_language_codes() -> Dict[str, str]:
+    if GoogleTranslator is None:
+        return {
+            "Russian": "ru",
+            "English": "en",
+            "Chinese": "zh-CN",
+            "Japanese": "ja",
+            "Korean": "ko",
+            "German": "de",
+            "French": "fr",
+            "Spanish": "es",
+            "Italian": "it",
+            "Portuguese": "pt",
+        }
+
+    try:
+        supported = GoogleTranslator(source="auto", target="en").get_supported_languages(
+            as_dict=True,
+        )
+    except Exception:  # pragma: no cover
+        supported = {}
+
+    return {
+        _display_language_name(name): code
+        for name, code in supported.items()
+        if isinstance(name, str) and isinstance(code, str)
+    }
+
+
+SUPPORTED_LANGUAGE_CODES = _supported_language_codes()
 LANGUAGE_CODES: Dict[str, str] = {
     "Auto Detect": "auto",
-    "Russian": "ru",
-    "English": "en",
-    "Chinese": "zh-CN",
-    "Japanese": "ja",
-    "Korean": "ko",
-    "German": "de",
-    "French": "fr",
-    "Spanish": "es",
-    "Italian": "it",
-    "Portuguese": "pt",
+    **SUPPORTED_LANGUAGE_CODES,
 }
 
 DETECT_TO_LANGUAGE_NAME: Dict[str, str] = {
-    "ru": "Russian",
-    "en": "English",
-    "zh-cn": "Chinese",
-    "zh-tw": "Chinese",
-    "ja": "Japanese",
-    "ko": "Korean",
-    "de": "German",
-    "fr": "French",
-    "es": "Spanish",
-    "it": "Italian",
-    "pt": "Portuguese",
+    code.lower(): name for name, code in SUPPORTED_LANGUAGE_CODES.items()
 }
+DETECT_TO_LANGUAGE_NAME["he"] = "Hebrew"
 
 _translation_cache: Dict[Tuple[str, str, str], str] = {}
 _cache_lock = threading.Lock()
@@ -71,6 +103,31 @@ def _normalize_language(language_name: str, fallback: str) -> str:
     if language_name in LANGUAGE_CODES:
         return language_name
     return fallback
+
+
+def _normalize_enabled_languages(value: object) -> List[str]:
+    if not isinstance(value, (list, tuple)):
+        return list(DEFAULT_ENABLED_LANGUAGES)
+
+    enabled = []
+    for language_name in value:
+        if (
+            isinstance(language_name, str)
+            and language_name in SUPPORTED_LANGUAGE_CODES
+            and language_name not in enabled
+        ):
+            enabled.append(language_name)
+
+    return enabled or list(DEFAULT_ENABLED_LANGUAGES)
+
+
+def _normalize_saved_enabled_languages() -> None:
+    options_data = getattr(shared.opts, "data", None)
+    if not isinstance(options_data, dict):
+        return
+    options_data["prompt_translator_enabled_languages"] = _normalize_enabled_languages(
+        options_data.get("prompt_translator_enabled_languages")
+    )
 
 
 def _translate_text(text: str, source_name: str, target_name: str) -> TranslateResponse:
@@ -136,22 +193,29 @@ def _translate_text(text: str, source_name: str, target_name: str) -> TranslateR
 
 
 def _register_routes(_: object, app: FastAPI) -> None:
-    def prompt_translator_settings_payload() -> Dict[str, str]:
+    def prompt_translator_settings_payload() -> Dict[str, object]:
         options_data = getattr(shared.opts, "data", {})
         if not isinstance(options_data, dict):
             options_data = {}
-        value = options_data.get(
+        default_source = options_data.get(
             "prompt_translator_default_source_language",
             "Auto Detect",
         )
-        return {"default_source_language": _normalize_language(value, "Auto Detect")}
+        enabled_languages = options_data.get(
+            "prompt_translator_enabled_languages",
+            DEFAULT_ENABLED_LANGUAGES,
+        )
+        return {
+            "default_source_language": _normalize_language(default_source, "Auto Detect"),
+            "enabled_languages": _normalize_enabled_languages(enabled_languages),
+        }
 
     @app.get("/prompt-translator/settings")
-    def prompt_translator_settings() -> Dict[str, str]:
+    def prompt_translator_settings() -> Dict[str, object]:
         return prompt_translator_settings_payload()
 
     @app.get("/sdapi/v1/prompt-translator/settings")
-    def prompt_translator_settings_sdapi() -> Dict[str, str]:
+    def prompt_translator_settings_sdapi() -> Dict[str, object]:
         return prompt_translator_settings_payload()
 
     @app.post("/prompt-translator/translate", response_model=TranslateResponse)
@@ -165,6 +229,20 @@ def _register_routes(_: object, app: FastAPI) -> None:
 
 def _register_settings() -> None:
     section = ("prompt_translator", "Prompt Translator")
+    shared.opts.add_option(
+        "prompt_translator_enabled_languages",
+        shared.OptionInfo(
+            list(DEFAULT_ENABLED_LANGUAGES),
+            "Languages shown in the translator interface",
+            gr.Dropdown,
+            {
+                "choices": list(SUPPORTED_LANGUAGE_CODES.keys()),
+                "multiselect": True,
+            },
+            onchange=_normalize_saved_enabled_languages,
+            section=section,
+        ).needs_reload_ui(),
+    )
     shared.opts.add_option(
         "prompt_translator_default_source_language",
         shared.OptionInfo(

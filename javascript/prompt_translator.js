@@ -7,7 +7,7 @@
     lastTarget: "prompt_translator_last_target",
   };
 
-  const BASE_LANGUAGES = [
+  const DEFAULT_LANGUAGES = [
     "Russian",
     "English",
     "Chinese",
@@ -19,8 +19,9 @@
     "Italian",
     "Portuguese",
   ];
-  const FROM_LANGUAGES = ["Auto Detect", ...BASE_LANGUAGES];
-  const TO_LANGUAGES = [...BASE_LANGUAGES];
+  let BASE_LANGUAGES = [...DEFAULT_LANGUAGES];
+  let FROM_LANGUAGES = ["Auto Detect", ...BASE_LANGUAGES];
+  let TO_LANGUAGES = [...BASE_LANGUAGES];
   const LIVE_TRANSLATE_DEBOUNCE_MS = 900;
   const VOICE_RESTART_DELAY_MS = 1400;
 
@@ -99,20 +100,31 @@
     return FROM_LANGUAGES.includes(value) ? value : "Auto Detect";
   }
 
-  function normalizeSourceLanguage(value) {
-    return FROM_LANGUAGES.includes(value) ? value : "";
+  function normalizeEnabledLanguages(value) {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    return [...new Set(value.filter((language) => typeof language === "string" && language))];
   }
 
-  function readDefaultSourceLanguageFromOptions(options) {
+  function readTranslatorSettingsFromOptions(options) {
     if (!options || typeof options !== "object") {
-      return "";
+      return {};
     }
     const optionData =
       options.data && typeof options.data === "object" ? options.data : options;
-    return normalizeSourceLanguage(optionData.prompt_translator_default_source_language);
+    const defaultSourceLanguage = optionData.prompt_translator_default_source_language;
+    const enabledLanguages = normalizeEnabledLanguages(
+      optionData.prompt_translator_enabled_languages,
+    );
+    return {
+      defaultSourceLanguage:
+        typeof defaultSourceLanguage === "string" ? defaultSourceLanguage : "",
+      enabledLanguages,
+    };
   }
 
-  function getDefaultSourceLanguageFromPageOptions() {
+  function getTranslatorSettingsFromPageOptions() {
     const candidates = [];
     if (typeof window !== "undefined" && window.opts && typeof window.opts === "object") {
       candidates.push(window.opts);
@@ -121,15 +133,15 @@
       candidates.push(opts);
     }
     for (const candidate of candidates) {
-      const value = readDefaultSourceLanguageFromOptions(candidate);
-      if (value) {
-        return value;
+      const settings = readTranslatorSettingsFromOptions(candidate);
+      if (settings.defaultSourceLanguage || settings.enabledLanguages.length) {
+        return settings;
       }
     }
-    return "";
+    return {};
   }
 
-  async function fetchDefaultSourceLanguage() {
+  async function fetchTranslatorSettings() {
     const endpoints = [
       "/prompt-translator/settings",
       "/sdapi/v1/prompt-translator/settings",
@@ -141,25 +153,55 @@
           continue;
         }
         const data = await response.json();
-        const value = normalizeSourceLanguage(
-          data.default_source_language || data.prompt_translator_default_source_language,
+        const defaultSourceLanguage =
+          data.default_source_language || data.prompt_translator_default_source_language || "";
+        const enabledLanguages = normalizeEnabledLanguages(
+          data.enabled_languages || data.prompt_translator_enabled_languages,
         );
-        if (value) {
-          return value;
+        if (defaultSourceLanguage || enabledLanguages.length) {
+          return { defaultSourceLanguage, enabledLanguages };
         }
       } catch (error) {
         // Try the next endpoint; Forge builds expose extension routes differently.
       }
     }
-    return "";
+    return {};
   }
 
-  async function getDefaultSourceLanguage() {
-    return (
-      getDefaultSourceLanguageFromPageOptions() ||
-      (await fetchDefaultSourceLanguage()) ||
-      "Auto Detect"
-    );
+  async function getTranslatorSettings() {
+    const pageSettings = getTranslatorSettingsFromPageOptions();
+    const fetchedSettings = await fetchTranslatorSettings();
+    return {
+      defaultSourceLanguage:
+        pageSettings.defaultSourceLanguage ||
+        fetchedSettings.defaultSourceLanguage ||
+        "Auto Detect",
+      enabledLanguages:
+        pageSettings.enabledLanguages && pageSettings.enabledLanguages.length
+          ? pageSettings.enabledLanguages
+          : fetchedSettings.enabledLanguages && fetchedSettings.enabledLanguages.length
+            ? fetchedSettings.enabledLanguages
+            : [...DEFAULT_LANGUAGES],
+    };
+  }
+
+  function configureInterfaceLanguages(enabledLanguages, defaultSourceLanguage) {
+    BASE_LANGUAGES = normalizeEnabledLanguages(enabledLanguages);
+    if (!BASE_LANGUAGES.length) {
+      BASE_LANGUAGES = [...DEFAULT_LANGUAGES];
+    }
+
+    const sourceLanguages = [...BASE_LANGUAGES];
+    if (
+      defaultSourceLanguage &&
+      defaultSourceLanguage !== "Auto Detect" &&
+      !sourceLanguages.includes(defaultSourceLanguage)
+    ) {
+      sourceLanguages.unshift(defaultSourceLanguage);
+    }
+
+    FROM_LANGUAGES = ["Auto Detect", ...sourceLanguages];
+    TO_LANGUAGES = [...BASE_LANGUAGES];
   }
 
   function setStoredSource(tabOrName, value) {
@@ -167,8 +209,9 @@
   }
 
   function getStoredTarget(tabOrName) {
-    const value = getStorageValueWithLegacy(tabOrName, STORAGE_KEYS.target, "English");
-    return TO_LANGUAGES.includes(value) ? value : "English";
+    const fallback = TO_LANGUAGES.includes("English") ? "English" : TO_LANGUAGES[0];
+    const value = getStorageValueWithLegacy(tabOrName, STORAGE_KEYS.target, fallback);
+    return TO_LANGUAGES.includes(value) ? value : fallback;
   }
 
   function setStoredTarget(tabOrName, value) {
@@ -1083,14 +1126,26 @@
 
   async function boot() {
     // Keep extension active in UI, and reset controls to defaults on each UI load.
-    const defaultSourceLanguage = await getDefaultSourceLanguage();
+    const translatorSettings = await getTranslatorSettings();
+    configureInterfaceLanguages(
+      translatorSettings.enabledLanguages,
+      translatorSettings.defaultSourceLanguage,
+    );
+    const defaultSourceLanguage = FROM_LANGUAGES.includes(
+      translatorSettings.defaultSourceLanguage,
+    )
+      ? translatorSettings.defaultSourceLanguage
+      : "Auto Detect";
+    const defaultTargetLanguage = TO_LANGUAGES.includes("English")
+      ? "English"
+      : TO_LANGUAGES[0];
     for (const tab of TABS) {
       setStoredEnabled(tab, false);
       setStoredSource(tab, defaultSourceLanguage);
-      setStoredTarget(tab, "English");
+      setStoredTarget(tab, defaultTargetLanguage);
       localStorage.removeItem(tabStorageKey(STORAGE_KEYS.lastDetectedSource, tab));
       if (!localStorage.getItem(tabStorageKey(STORAGE_KEYS.lastTarget, tab))) {
-        setLastTarget(tab, "English");
+        setLastTarget(tab, defaultTargetLanguage);
       }
     }
 
