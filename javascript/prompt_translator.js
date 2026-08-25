@@ -45,6 +45,8 @@
   const state = {
     rows: new Map(),
     liveTranslateTimers: new Map(),
+    translationPendingCounts: new Map(),
+    translationPromises: new Map(),
     voiceSessions: new Map(),
     isInitialized: false,
   };
@@ -252,10 +254,6 @@
     if (/[\u0400-\u04ff]/.test(text)) {
       return "Russian";
     }
-    if (/[A-Za-z]/.test(text)) {
-      return "English";
-    }
-
     return "";
   }
 
@@ -521,6 +519,36 @@
     throw lastError || new Error("translate API is unavailable");
   }
 
+  function setTranslationButtonState(tab, busy, errorMessage = "") {
+    const tabName = resolveTabName(tab);
+    const previousCount = state.translationPendingCounts.get(tabName) || 0;
+    const pendingCount = busy ? previousCount + 1 : Math.max(0, previousCount - 1);
+    if (pendingCount) {
+      state.translationPendingCounts.set(tabName, pendingCount);
+    } else {
+      state.translationPendingCounts.delete(tabName);
+    }
+
+    const rowState = state.rows.get(tabName);
+    const button = rowState && rowState.translateButton;
+    if (!button) {
+      return;
+    }
+
+    if (!button.dataset.ptDefaultLabel) {
+      button.dataset.ptDefaultLabel = button.textContent || "Translate";
+    }
+    const isBusy = pendingCount > 0;
+    button.disabled = isBusy;
+    button.setAttribute("aria-busy", isBusy ? "true" : "false");
+    button.textContent = isBusy
+      ? "Translating…"
+      : errorMessage
+        ? "Retry"
+        : button.dataset.ptDefaultLabel;
+    button.title = isBusy ? "" : errorMessage || "";
+  }
+
   async function translateTabPrompt(tab, options = {}) {
     const promptArea = findFirst(tab.promptSelectors);
     if (!promptArea) {
@@ -551,8 +579,21 @@
         return true;
       }
     }
+    const requestKey = [tab.name, effectiveSource, target, currentText].join("\u0000");
+    let requestPromise = state.translationPromises.get(requestKey);
+    const ownsRequest = !requestPromise;
+    let requestError = "";
+    if (!requestPromise) {
+      requestPromise = callTranslateApi(currentText, effectiveSource, target);
+      state.translationPromises.set(requestKey, requestPromise);
+      setTranslationButtonState(tab, true);
+    }
+
     try {
-      const result = await callTranslateApi(currentText, effectiveSource, target);
+      const result = await requestPromise;
+      if (!result || result.ok === false) {
+        throw new Error((result && result.error) || "translation backend returned no result");
+      }
       setLastTarget(tab, target);
       let detectedSource = "";
       if (result && typeof result.detected_source === "string" && result.detected_source) {
@@ -590,13 +631,16 @@
         });
       }
 
-      if (result && result.ok === false) {
-        console.warn("[prompt-translator] backend error:", result.error || "unknown");
-      }
       return true;
     } catch (error) {
+      requestError = error instanceof Error ? error.message : String(error);
       console.warn("[prompt-translator] translation failed:", error);
       return false;
+    } finally {
+      if (ownsRequest && state.translationPromises.get(requestKey) === requestPromise) {
+        state.translationPromises.delete(requestKey);
+        setTranslationButtonState(tab, false, requestError);
+      }
     }
   }
 

@@ -1,7 +1,10 @@
 import threading
+import time
 from typing import Dict, List, Tuple
 
 import gradio as gr
+import requests
+from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
@@ -82,6 +85,19 @@ DETECT_TO_LANGUAGE_NAME["he"] = "Hebrew"
 _translation_cache: Dict[Tuple[str, str, str], str] = {}
 _cache_lock = threading.Lock()
 
+GOOGLE_TRANSLATE_URL = "https://translate.google.com/m"
+GOOGLE_TRANSLATE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+GOOGLE_TRANSLATE_TIMEOUT = (5, 15)
+GOOGLE_TRANSLATE_ATTEMPTS = 3
+GOOGLE_TRANSLATE_CHUNK_SIZE = 3500
+
 
 class TranslateRequest(BaseModel):
     text: str = Field(default="")
@@ -130,6 +146,77 @@ def _normalize_saved_enabled_languages() -> None:
     )
 
 
+def _split_translation_text(text: str) -> List[str]:
+    if len(text) <= GOOGLE_TRANSLATE_CHUNK_SIZE:
+        return [text]
+
+    chunks = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= GOOGLE_TRANSLATE_CHUNK_SIZE:
+            chunks.append(remaining)
+            break
+
+        split_at = remaining.rfind(" ", 0, GOOGLE_TRANSLATE_CHUNK_SIZE + 1)
+        if split_at <= 0:
+            split_at = GOOGLE_TRANSLATE_CHUNK_SIZE
+        else:
+            split_at += 1
+
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+
+    return chunks
+
+
+def _translate_google_chunk(text: str, source_code: str, target_code: str) -> str:
+    leading_whitespace = text[: len(text) - len(text.lstrip())]
+    trailing_whitespace = text[len(text.rstrip()) :]
+    text_to_translate = text.strip()
+    if not text_to_translate:
+        return text
+
+    last_error: Exception = RuntimeError("Google Translate returned no result")
+
+    for attempt in range(GOOGLE_TRANSLATE_ATTEMPTS):
+        try:
+            response = requests.get(
+                GOOGLE_TRANSLATE_URL,
+                params={"sl": source_code, "tl": target_code, "q": text_to_translate},
+                headers=GOOGLE_TRANSLATE_HEADERS,
+                timeout=GOOGLE_TRANSLATE_TIMEOUT,
+            )
+            if response.status_code == 429:
+                raise RuntimeError("Google Translate rate limit reached")
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            element = soup.find("div", {"class": "result-container"})
+            if element is None:
+                element = soup.find("div", {"class": "t0"})
+            if element is None:
+                raise RuntimeError("Google Translate returned an error page")
+
+            translated = element.get_text(strip=True)
+            if not translated:
+                raise RuntimeError("Google Translate returned an empty result")
+            return leading_whitespace + translated + trailing_whitespace
+        except (requests.RequestException, RuntimeError) as exc:
+            last_error = exc
+            if attempt + 1 < GOOGLE_TRANSLATE_ATTEMPTS:
+                time.sleep(0.4 * (attempt + 1))
+
+    raise last_error
+
+
+def _translate_with_google(text: str, source_code: str, target_code: str) -> str:
+    translated_chunks = [
+        _translate_google_chunk(chunk, source_code, target_code)
+        for chunk in _split_translation_text(text)
+    ]
+    return "".join(translated_chunks)
+
+
 def _translate_text(text: str, source_name: str, target_name: str) -> TranslateResponse:
     source_name = _normalize_language(source_name, "Auto Detect")
     target_name = _normalize_language(target_name, "English")
@@ -170,7 +257,7 @@ def _translate_text(text: str, source_name: str, target_name: str) -> TranslateR
         )
 
     try:
-        translated = GoogleTranslator(source=source_code, target=target_code).translate(text)
+        translated = _translate_with_google(text, source_code, target_code)
         if translated is None:
             translated = text
 
