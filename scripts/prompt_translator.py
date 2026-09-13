@@ -1,10 +1,12 @@
+import json
+import shutil
+import subprocess
 import threading
 import time
 from typing import Dict, List, Tuple
 
 import gradio as gr
 import requests
-from bs4 import BeautifulSoup
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
@@ -85,7 +87,7 @@ DETECT_TO_LANGUAGE_NAME["he"] = "Hebrew"
 _translation_cache: Dict[Tuple[str, str, str], str] = {}
 _cache_lock = threading.Lock()
 
-GOOGLE_TRANSLATE_URL = "https://translate.google.com/m"
+GOOGLE_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 GOOGLE_TRANSLATE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -97,6 +99,10 @@ GOOGLE_TRANSLATE_HEADERS = {
 GOOGLE_TRANSLATE_TIMEOUT = (5, 15)
 GOOGLE_TRANSLATE_ATTEMPTS = 3
 GOOGLE_TRANSLATE_CHUNK_SIZE = 3500
+
+
+class GoogleTranslateRateLimitError(RuntimeError):
+    """Google rejected the Python HTTP client before processing the request."""
 
 
 class TranslateRequest(BaseModel):
@@ -169,6 +175,71 @@ def _split_translation_text(text: str) -> List[str]:
     return chunks
 
 
+def _parse_google_translation_payload(payload: object) -> str:
+    try:
+        return "".join(
+            part[0]
+            for part in payload[0]
+            if isinstance(part, list)
+            and part
+            and isinstance(part[0], str)
+        )
+    except (IndexError, TypeError):
+        raise RuntimeError("Google Translate returned an invalid response") from None
+
+
+def _translate_google_chunk_with_curl(
+    text: str,
+    source_code: str,
+    target_code: str,
+) -> str:
+    curl = shutil.which("curl.exe") or shutil.which("curl")
+    if not curl:
+        raise RuntimeError("curl is not available for the Google Translate fallback")
+
+    command = [
+        curl,
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--get",
+        GOOGLE_TRANSLATE_URL,
+        "--header",
+        "User-Agent: " + GOOGLE_TRANSLATE_HEADERS["User-Agent"],
+        "--header",
+        "Accept-Language: " + GOOGLE_TRANSLATE_HEADERS["Accept-Language"],
+    ]
+    for key, value in (
+        ("client", "gtx"),
+        ("dt", "t"),
+        ("sl", source_code),
+        ("tl", target_code),
+        ("q", text),
+    ):
+        command.extend(("--data-urlencode", f"{key}={value}"))
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+            timeout=sum(GOOGLE_TRANSLATE_TIMEOUT),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("Google Translate curl fallback failed") from exc
+
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or "Google Translate curl fallback failed"
+        raise RuntimeError(message)
+
+    try:
+        return _parse_google_translation_payload(json.loads(completed.stdout))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Google Translate returned an invalid response") from exc
+
+
 def _translate_google_chunk(text: str, source_code: str, target_code: str) -> str:
     leading_whitespace = text[: len(text) - len(text.lstrip())]
     trailing_whitespace = text[len(text.rstrip()) :]
@@ -182,29 +253,42 @@ def _translate_google_chunk(text: str, source_code: str, target_code: str) -> st
         try:
             response = requests.get(
                 GOOGLE_TRANSLATE_URL,
-                params={"sl": source_code, "tl": target_code, "q": text_to_translate},
+                params={
+                    "client": "gtx",
+                    "dt": "t",
+                    "sl": source_code,
+                    "tl": target_code,
+                    "q": text_to_translate,
+                },
                 headers=GOOGLE_TRANSLATE_HEADERS,
                 timeout=GOOGLE_TRANSLATE_TIMEOUT,
             )
             if response.status_code == 429:
-                raise RuntimeError("Google Translate rate limit reached")
+                raise GoogleTranslateRateLimitError("Google Translate rate limit reached")
             response.raise_for_status()
 
-            soup = BeautifulSoup(response.text, "html.parser")
-            element = soup.find("div", {"class": "result-container"})
-            if element is None:
-                element = soup.find("div", {"class": "t0"})
-            if element is None:
-                raise RuntimeError("Google Translate returned an error page")
-
-            translated = element.get_text(strip=True)
+            try:
+                translated = _parse_google_translation_payload(response.json())
+            except (RuntimeError, ValueError) as exc:
+                raise RuntimeError("Google Translate returned an invalid response") from exc
             if not translated:
                 raise RuntimeError("Google Translate returned an empty result")
             return leading_whitespace + translated + trailing_whitespace
         except (requests.RequestException, RuntimeError) as exc:
             last_error = exc
+            if isinstance(exc, GoogleTranslateRateLimitError):
+                break
             if attempt + 1 < GOOGLE_TRANSLATE_ATTEMPTS:
                 time.sleep(0.4 * (attempt + 1))
+
+    if isinstance(last_error, GoogleTranslateRateLimitError):
+        translated = _translate_google_chunk_with_curl(
+            text_to_translate,
+            source_code,
+            target_code,
+        )
+        if translated:
+            return leading_whitespace + translated + trailing_whitespace
 
     raise last_error
 
