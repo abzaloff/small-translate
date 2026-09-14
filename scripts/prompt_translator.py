@@ -1,4 +1,6 @@
+import gc
 import json
+import os
 import shutil
 import subprocess
 import threading
@@ -10,7 +12,7 @@ import requests
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-from modules import script_callbacks, shared
+from modules import paths, script_callbacks, shared
 
 try:
     from deep_translator import GoogleTranslator
@@ -22,6 +24,23 @@ try:
 except Exception:  # pragma: no cover
     LangDetectException = Exception
     detect = None
+
+try:
+    import torch
+    from transformers import AutoTokenizer
+except Exception:  # pragma: no cover
+    torch = None
+    AutoTokenizer = None
+
+try:
+    import ctranslate2
+except Exception:  # pragma: no cover
+    ctranslate2 = None
+
+try:
+    from huggingface_hub import snapshot_download
+except Exception:  # pragma: no cover
+    snapshot_download = None
 
 
 DEFAULT_ENABLED_LANGUAGES = [
@@ -36,6 +55,38 @@ DEFAULT_ENABLED_LANGUAGES = [
     "Italian",
     "Portuguese",
 ]
+
+NLLB_LANGUAGE_CODES = {
+    "Russian": "rus_Cyrl",
+    "English": "eng_Latn",
+    "Chinese": "zho_Hans",
+    "Japanese": "jpn_Jpan",
+    "Korean": "kor_Hang",
+    "German": "deu_Latn",
+    "French": "fra_Latn",
+    "Spanish": "spa_Latn",
+    "Italian": "ita_Latn",
+    "Portuguese": "por_Latn",
+}
+NLLB_PROVIDER = "NLLB-200 (local)"
+GOOGLE_PROVIDER = "Google (online)"
+NLLB_DEFAULT_MODEL_PATH = os.path.join(
+    paths.models_path,
+    "prompt-translator",
+    "nllb-200-distilled-600M-ct2-int8",
+)
+NLLB_CHUNK_SIZE = 1200
+NLLB_MODEL_REPOSITORY = "JustFrederik/nllb-200-distilled-600M-ct2-int8"
+NLLB_DOWNLOAD_SIZE_BYTES = 650_000_000
+NLLB_REQUIRED_FILES = (
+    "config.json",
+    "model.bin",
+    "sentencepiece.bpe.model",
+    "shared_vocabulary.txt",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+)
 
 
 def _display_language_name(language_name: str) -> str:
@@ -84,8 +135,20 @@ DETECT_TO_LANGUAGE_NAME: Dict[str, str] = {
 }
 DETECT_TO_LANGUAGE_NAME["he"] = "Hebrew"
 
-_translation_cache: Dict[Tuple[str, str, str], str] = {}
+_translation_cache: Dict[Tuple[str, str, str, str], str] = {}
 _cache_lock = threading.Lock()
+_nllb_lock = threading.Lock()
+_nllb_model = None
+_nllb_tokenizer = None
+_nllb_model_path = ""
+_nllb_device = ""
+_nllb_download_lock = threading.Lock()
+_nllb_download_thread = None
+_nllb_download_state = {
+    "model_path": "",
+    "state": "idle",
+    "error": "",
+}
 
 GOOGLE_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 GOOGLE_TRANSLATE_HEADERS = {
@@ -117,6 +180,10 @@ class TranslateResponse(BaseModel):
     ok: bool = True
     error: str = ""
     detected_source: str = ""
+
+
+class NllbDownloadRequest(BaseModel):
+    model_path: str = Field(default="")
 
 
 def _normalize_language(language_name: str, fallback: str) -> str:
@@ -152,20 +219,20 @@ def _normalize_saved_enabled_languages() -> None:
     )
 
 
-def _split_translation_text(text: str) -> List[str]:
-    if len(text) <= GOOGLE_TRANSLATE_CHUNK_SIZE:
+def _split_translation_text(text: str, chunk_size: int) -> List[str]:
+    if len(text) <= chunk_size:
         return [text]
 
     chunks = []
     remaining = text
     while remaining:
-        if len(remaining) <= GOOGLE_TRANSLATE_CHUNK_SIZE:
+        if len(remaining) <= chunk_size:
             chunks.append(remaining)
             break
 
-        split_at = remaining.rfind(" ", 0, GOOGLE_TRANSLATE_CHUNK_SIZE + 1)
+        split_at = remaining.rfind(" ", 0, chunk_size + 1)
         if split_at <= 0:
-            split_at = GOOGLE_TRANSLATE_CHUNK_SIZE
+            split_at = chunk_size
         else:
             split_at += 1
 
@@ -296,9 +363,328 @@ def _translate_google_chunk(text: str, source_code: str, target_code: str) -> st
 def _translate_with_google(text: str, source_code: str, target_code: str) -> str:
     translated_chunks = [
         _translate_google_chunk(chunk, source_code, target_code)
-        for chunk in _split_translation_text(text)
+        for chunk in _split_translation_text(text, GOOGLE_TRANSLATE_CHUNK_SIZE)
     ]
     return "".join(translated_chunks)
+
+
+def _get_translation_provider() -> str:
+    options_data = getattr(shared.opts, "data", {})
+    if not isinstance(options_data, dict):
+        options_data = {}
+    provider = options_data.get(
+        "prompt_translator_provider",
+        GOOGLE_PROVIDER,
+    )
+    return provider if provider in (GOOGLE_PROVIDER, NLLB_PROVIDER) else GOOGLE_PROVIDER
+
+
+def _get_nllb_model_path() -> str:
+    options_data = getattr(shared.opts, "data", {})
+    if not isinstance(options_data, dict):
+        options_data = {}
+    configured_path = options_data.get(
+        "prompt_translator_nllb_model_path",
+        NLLB_DEFAULT_MODEL_PATH,
+    )
+    if not isinstance(configured_path, str) or not configured_path.strip():
+        return NLLB_DEFAULT_MODEL_PATH
+    return os.path.abspath(configured_path.strip())
+
+
+def _get_nllb_execution_device() -> str:
+    options_data = getattr(shared.opts, "data", {})
+    if not isinstance(options_data, dict):
+        options_data = {}
+    selected_device = options_data.get("prompt_translator_nllb_device", "GPU")
+    if selected_device == "CPU":
+        return "cpu"
+    if torch is None or not torch.cuda.is_available():
+        raise RuntimeError(
+            "NLLB GPU mode is selected, but CUDA is unavailable. "
+            "Select CPU under Settings > Prompt Translator."
+        )
+    return "cuda"
+
+
+def _normalize_nllb_model_path(model_path: object) -> str:
+    if not isinstance(model_path, str) or not model_path.strip():
+        return _get_nllb_model_path()
+    return os.path.abspath(model_path.strip())
+
+
+def _nllb_model_is_ready(model_path: str) -> bool:
+    return all(
+        os.path.isfile(os.path.join(model_path, filename))
+        for filename in NLLB_REQUIRED_FILES
+    )
+
+
+def _nllb_downloaded_bytes(model_path: str) -> int:
+    if not os.path.isdir(model_path):
+        return 0
+
+    total = 0
+    for root, _, filenames in os.walk(model_path):
+        for filename in filenames:
+            try:
+                total += os.path.getsize(os.path.join(root, filename))
+            except OSError:
+                pass
+    return total
+
+
+def _nllb_status(model_path: object = "") -> Dict[str, object]:
+    normalized_path = _normalize_nllb_model_path(model_path)
+    with _nllb_download_lock:
+        state = dict(_nllb_download_state)
+        download_in_progress = (
+            state["state"] == "downloading"
+            and state["model_path"] == normalized_path
+        )
+
+    downloaded_bytes = _nllb_downloaded_bytes(normalized_path)
+    ready = _nllb_model_is_ready(normalized_path)
+    loaded = _nllb_model is not None and _nllb_model_path == normalized_path
+    loaded_any = _nllb_model is not None
+    return {
+        "model_path": normalized_path,
+        "ready": ready,
+        "loaded": loaded,
+        "loaded_any": loaded_any,
+        "loaded_model_path": _nllb_model_path if loaded_any else "",
+        "execution_device": _nllb_device if loaded_any else "",
+        "downloading": download_in_progress,
+        "download_state": (
+            state["state"]
+            if state["model_path"] == normalized_path and state["state"] == "error"
+            else "downloading"
+            if download_in_progress
+            else "ready"
+            if ready
+            else "idle"
+        ),
+        "downloaded_bytes": downloaded_bytes,
+        "total_bytes": NLLB_DOWNLOAD_SIZE_BYTES,
+        "progress_percent": min(
+            100,
+            round(downloaded_bytes * 100 / NLLB_DOWNLOAD_SIZE_BYTES, 1),
+        ),
+        "error": state["error"] if state["model_path"] == normalized_path else "",
+    }
+
+
+def _download_nllb_model(model_path: str) -> None:
+    global _nllb_download_thread, _nllb_download_state
+
+    try:
+        if snapshot_download is None:
+            raise RuntimeError(
+                "NLLB download requires huggingface_hub. Restart Forge after "
+                "installing the extension dependencies."
+            )
+
+        os.makedirs(model_path, exist_ok=True)
+        snapshot_download(
+            repo_id=NLLB_MODEL_REPOSITORY,
+            local_dir=model_path,
+            allow_patterns=list(NLLB_REQUIRED_FILES),
+        )
+        if not _nllb_model_is_ready(model_path):
+            raise RuntimeError("The NLLB download completed but required files are missing.")
+
+        with _nllb_download_lock:
+            _nllb_download_state = {
+                "model_path": model_path,
+                "state": "ready",
+                "error": "",
+            }
+    except Exception as exc:  # pragma: no cover - depends on network/filesystem
+        with _nllb_download_lock:
+            _nllb_download_state = {
+                "model_path": model_path,
+                "state": "error",
+                "error": str(exc),
+            }
+    finally:
+        with _nllb_download_lock:
+            _nllb_download_thread = None
+
+
+def _start_nllb_download(model_path: object = "") -> Dict[str, object]:
+    global _nllb_download_state, _nllb_download_thread
+
+    normalized_path = _normalize_nllb_model_path(model_path)
+    with _nllb_download_lock:
+        if _nllb_download_thread is not None and _nllb_download_thread.is_alive():
+            already_downloading = True
+        else:
+            already_downloading = False
+
+        if not already_downloading and _nllb_model_is_ready(normalized_path):
+            model_is_ready = True
+        else:
+            model_is_ready = False
+
+        if not already_downloading and not model_is_ready:
+            _nllb_download_state = {
+                "model_path": normalized_path,
+                "state": "downloading",
+                "error": "",
+            }
+            _nllb_download_thread = threading.Thread(
+                target=_download_nllb_model,
+                args=(normalized_path,),
+                daemon=True,
+                name="prompt-translator-nllb-download",
+            )
+            _nllb_download_thread.start()
+
+    if already_downloading:
+        return {
+            "ok": False,
+            "error": "An NLLB download is already running.",
+            **_nllb_status(normalized_path),
+        }
+    if model_is_ready:
+        return {"ok": True, **_nllb_status(normalized_path)}
+
+    return {"ok": True, **_nllb_status(normalized_path)}
+
+
+def _unload_nllb_model() -> Dict[str, object]:
+    global _nllb_device, _nllb_model, _nllb_model_path, _nllb_tokenizer
+
+    with _nllb_lock:
+        model_path = _nllb_model_path
+        model = _nllb_model
+        tokenizer = _nllb_tokenizer
+        _nllb_model = None
+        _nllb_tokenizer = None
+        _nllb_model_path = ""
+        _nllb_device = ""
+
+    if model is not None:
+        try:
+            model.unload_model()
+        except Exception:
+            pass
+    del model
+    del tokenizer
+    gc.collect()
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    with _cache_lock:
+        nllb_keys = [key for key in _translation_cache if key[0] == NLLB_PROVIDER]
+        for key in nllb_keys:
+            del _translation_cache[key]
+
+    return {
+        "ok": True,
+        "unloaded": bool(model_path),
+        **_nllb_status(model_path),
+    }
+
+
+def _load_nllb_model(model_path: str):
+    global _nllb_device, _nllb_model, _nllb_model_path, _nllb_tokenizer
+
+    if ctranslate2 is None or AutoTokenizer is None:
+        raise RuntimeError(
+            "NLLB INT8 requires ctranslate2, transformers, and sentencepiece. "
+            "Restart Forge after installing the extension dependencies."
+        )
+    if not _nllb_model_is_ready(model_path):
+        raise RuntimeError(
+            "NLLB INT8 model was not found at "
+            + model_path
+            + ". Download it from Settings > Prompt Translator or set its path "
+            "under Settings > Prompt Translator."
+        )
+
+    device = _get_nllb_execution_device()
+    with _nllb_lock:
+        if (
+            _nllb_model is not None
+            and _nllb_model_path == model_path
+            and _nllb_device == device
+        ):
+            return _nllb_tokenizer, _nllb_model
+
+        previous_model = _nllb_model
+        _nllb_model = None
+        _nllb_tokenizer = None
+        _nllb_model_path = ""
+        _nllb_device = ""
+        if previous_model is not None:
+            try:
+                previous_model.unload_model()
+            except Exception:
+                pass
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+        model = ctranslate2.Translator(
+            model_path,
+            device=device,
+            compute_type="int8_float16" if device == "cuda" else "int8",
+        )
+
+        _nllb_tokenizer = tokenizer
+        _nllb_model = model
+        _nllb_model_path = model_path
+        _nllb_device = device
+        return tokenizer, model
+
+
+def _translate_nllb_chunk(
+    text: str,
+    source_code: str,
+    target_code: str,
+    tokenizer: object,
+    model: object,
+) -> str:
+    leading_whitespace = text[: len(text) - len(text.lstrip())]
+    trailing_whitespace = text[len(text.rstrip()) :]
+    text_to_translate = text.strip()
+    if not text_to_translate:
+        return text
+
+    tokenizer.src_lang = source_code
+    source_tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(text_to_translate))
+    result = model.translate_batch(
+        [source_tokens],
+        target_prefix=[[target_code]],
+        beam_size=4,
+        max_input_length=512,
+        max_decoding_length=512,
+    )
+    translated_tokens = result[0].hypotheses[0]
+    if translated_tokens and translated_tokens[0] == target_code:
+        translated_tokens = translated_tokens[1:]
+    translated = tokenizer.decode(
+        tokenizer.convert_tokens_to_ids(translated_tokens),
+        skip_special_tokens=True,
+    )
+    if not translated:
+        raise RuntimeError("NLLB returned an empty result")
+    return leading_whitespace + translated + trailing_whitespace
+
+
+def _translate_with_nllb(text: str, source_name: str, target_name: str) -> str:
+    source_code = NLLB_LANGUAGE_CODES.get(source_name)
+    target_code = NLLB_LANGUAGE_CODES.get(target_name)
+    if not source_code or not target_code:
+        supported = ", ".join(NLLB_LANGUAGE_CODES)
+        raise RuntimeError(
+            "NLLB local provider currently supports: " + supported + "."
+        )
+
+    tokenizer, model = _load_nllb_model(_get_nllb_model_path())
+    return "".join(
+        _translate_nllb_chunk(chunk, source_code, target_code, tokenizer, model)
+        for chunk in _split_translation_text(text, NLLB_CHUNK_SIZE)
+    )
 
 
 def _translate_text(text: str, source_name: str, target_name: str) -> TranslateResponse:
@@ -321,7 +707,17 @@ def _translate_text(text: str, source_name: str, target_name: str) -> TranslateR
         except LangDetectException:
             detected_source = ""
 
-    cache_key = (text, source_code, target_code)
+    effective_source_name = detected_source or source_name
+    provider = _get_translation_provider()
+    if provider == NLLB_PROVIDER and source_name == "Auto Detect" and not detected_source:
+        return TranslateResponse(
+            translated_text=text,
+            used_cache=False,
+            ok=False,
+            error="NLLB could not detect the source language. Select it explicitly.",
+        )
+
+    cache_key = (provider, text, source_code, target_code)
     with _cache_lock:
         cached = _translation_cache.get(cache_key)
     if cached is not None:
@@ -332,7 +728,7 @@ def _translate_text(text: str, source_name: str, target_name: str) -> TranslateR
             detected_source=detected_source,
         )
 
-    if GoogleTranslator is None:
+    if provider == GOOGLE_PROVIDER and GoogleTranslator is None:
         return TranslateResponse(
             translated_text=text,
             used_cache=False,
@@ -341,7 +737,14 @@ def _translate_text(text: str, source_name: str, target_name: str) -> TranslateR
         )
 
     try:
-        translated = _translate_with_google(text, source_code, target_code)
+        if provider == NLLB_PROVIDER:
+            translated = _translate_with_nllb(
+                text,
+                effective_source_name,
+                target_name,
+            )
+        else:
+            translated = _translate_with_google(text, source_code, target_code)
         if translated is None:
             translated = text
 
@@ -379,6 +782,7 @@ def _register_routes(_: object, app: FastAPI) -> None:
         return {
             "default_source_language": _normalize_language(default_source, "Auto Detect"),
             "enabled_languages": _normalize_enabled_languages(enabled_languages),
+            "provider": _get_translation_provider(),
         }
 
     @app.get("/prompt-translator/settings")
@@ -388,6 +792,32 @@ def _register_routes(_: object, app: FastAPI) -> None:
     @app.get("/sdapi/v1/prompt-translator/settings")
     def prompt_translator_settings_sdapi() -> Dict[str, object]:
         return prompt_translator_settings_payload()
+
+    @app.get("/prompt-translator/nllb/status")
+    def prompt_translator_nllb_status(model_path: str = "") -> Dict[str, object]:
+        return _nllb_status(model_path)
+
+    @app.get("/sdapi/v1/prompt-translator/nllb/status")
+    def prompt_translator_nllb_status_sdapi(model_path: str = "") -> Dict[str, object]:
+        return _nllb_status(model_path)
+
+    @app.post("/prompt-translator/nllb/download")
+    def prompt_translator_nllb_download(payload: NllbDownloadRequest) -> Dict[str, object]:
+        return _start_nllb_download(payload.model_path)
+
+    @app.post("/sdapi/v1/prompt-translator/nllb/download")
+    def prompt_translator_nllb_download_sdapi(
+        payload: NllbDownloadRequest,
+    ) -> Dict[str, object]:
+        return _start_nllb_download(payload.model_path)
+
+    @app.post("/prompt-translator/nllb/unload")
+    def prompt_translator_nllb_unload() -> Dict[str, object]:
+        return _unload_nllb_model()
+
+    @app.post("/sdapi/v1/prompt-translator/nllb/unload")
+    def prompt_translator_nllb_unload_sdapi() -> Dict[str, object]:
+        return _unload_nllb_model()
 
     @app.post("/prompt-translator/translate", response_model=TranslateResponse)
     def prompt_translator_translate(payload: TranslateRequest) -> TranslateResponse:
@@ -400,6 +830,35 @@ def _register_routes(_: object, app: FastAPI) -> None:
 
 def _register_settings() -> None:
     section = ("prompt_translator", "Prompt Translator")
+    shared.opts.add_option(
+        "prompt_translator_provider",
+        shared.OptionInfo(
+            GOOGLE_PROVIDER,
+            "Translation provider",
+            gr.Dropdown,
+            {"choices": [GOOGLE_PROVIDER, NLLB_PROVIDER]},
+            section=section,
+        ),
+    )
+    shared.opts.add_option(
+        "prompt_translator_nllb_device",
+        shared.OptionInfo(
+            "GPU",
+            "NLLB INT8 device",
+            gr.Radio,
+            {"choices": ["GPU", "CPU"]},
+            section=section,
+        ),
+    )
+    shared.opts.add_option(
+        "prompt_translator_nllb_model_path",
+        shared.OptionInfo(
+            NLLB_DEFAULT_MODEL_PATH,
+            "NLLB INT8 model path (CTranslate2, about 0.6 GB)",
+            gr.Textbox,
+            section=section,
+        ),
+    )
     shared.opts.add_option(
         "prompt_translator_enabled_languages",
         shared.OptionInfo(

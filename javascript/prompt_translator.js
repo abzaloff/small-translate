@@ -58,6 +58,185 @@
     return document;
   }
 
+  function formatByteSize(bytes) {
+    if (!Number.isFinite(bytes) || bytes <= 0) {
+      return "0 B";
+    }
+    const units = ["B", "KB", "MB", "GB"];
+    const unitIndex = Math.min(
+      Math.floor(Math.log(bytes) / Math.log(1024)),
+      units.length - 1,
+    );
+    return (bytes / Math.pow(1024, unitIndex)).toFixed(unitIndex >= 3 ? 2 : 0) + " " + units[unitIndex];
+  }
+
+  async function callNllbApi(path, options = {}) {
+    const endpoints = [
+      "/prompt-translator/nllb/" + path,
+      "/sdapi/v1/prompt-translator/nllb/" + path,
+    ];
+    let lastError = null;
+    for (const endpoint of endpoints) {
+      try {
+        const response = await fetch(endpoint, options);
+        if (!response.ok) {
+          lastError = new Error("HTTP " + response.status);
+          continue;
+        }
+        return await response.json();
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError || new Error("NLLB API is unavailable");
+  }
+
+  function nllbSettingsModelPath() {
+    const setting = appRoot().querySelector("#setting_prompt_translator_nllb_model_path");
+    if (!setting) {
+      return "";
+    }
+    const input = setting.querySelector("textarea, input");
+    return input ? input.value.trim() : "";
+  }
+
+  function mountNllbSettingsActions() {
+    const root = appRoot();
+    const modelPathSetting = root.querySelector("#setting_prompt_translator_nllb_model_path");
+    if (!modelPathSetting || modelPathSetting.dataset.ptNllbActions === "1") {
+      return;
+    }
+
+    modelPathSetting.dataset.ptNllbActions = "1";
+    const panel = document.createElement("div");
+    panel.className = "prompt-translator-nllb-actions";
+    panel.style.display = "flex";
+    panel.style.alignItems = "center";
+    panel.style.flexWrap = "wrap";
+    panel.style.gap = "8px";
+    panel.style.margin = "6px 0 12px";
+
+    const downloadButton = document.createElement("button");
+    downloadButton.type = "button";
+    downloadButton.textContent = "Download NLLB INT8 model (0.6 GB)";
+    downloadButton.title = "Download the local NLLB INT8 translation model";
+
+    const unloadButton = document.createElement("button");
+    unloadButton.type = "button";
+    unloadButton.textContent = "Unload NLLB from memory";
+    unloadButton.title = "Free RAM and VRAM without deleting the NLLB model files";
+
+    for (const button of [downloadButton, unloadButton]) {
+      button.style.cursor = "pointer";
+      button.style.display = "inline-flex";
+      button.style.alignItems = "center";
+      button.style.justifyContent = "center";
+      button.style.minHeight = "var(--input-height, 32px)";
+      button.style.padding = "0 12px";
+      button.style.border = "1px solid var(--button-secondary-border-color, var(--border-color-primary, #4b5563))";
+      button.style.borderRadius = "var(--radius-lg, 8px)";
+      button.style.background = "var(--button-secondary-background-fill, var(--input-background-fill, #1f2937))";
+      button.style.color = "var(--button-secondary-text-color, var(--body-text-color, #ffffff))";
+      button.style.fontWeight = "600";
+      button.style.textDecoration = "underline";
+      button.style.textUnderlineOffset = "3px";
+    }
+
+    const status = document.createElement("span");
+    status.setAttribute("role", "status");
+    status.style.opacity = "0.85";
+    status.style.fontSize = "0.9em";
+
+    const hint = document.createElement("span");
+    hint.textContent = "Set the provider/path, then click Apply settings to save them.";
+    hint.style.opacity = "0.7";
+    hint.style.fontSize = "0.85em";
+    hint.style.flexBasis = "100%";
+
+    panel.appendChild(downloadButton);
+    panel.appendChild(unloadButton);
+    panel.appendChild(status);
+    panel.appendChild(hint);
+    modelPathSetting.insertAdjacentElement("afterend", panel);
+
+    let pollTimer = null;
+    const scheduleStatusRefresh = (delay = 0) => {
+      if (pollTimer !== null) {
+        window.clearTimeout(pollTimer);
+      }
+      pollTimer = window.setTimeout(refreshStatus, delay);
+    };
+
+    const renderStatus = (data) => {
+      const path = data.model_path || nllbSettingsModelPath();
+      const downloaded = formatByteSize(Number(data.downloaded_bytes || 0));
+      const total = formatByteSize(Number(data.total_bytes || 0));
+      if (data.downloading) {
+        downloadButton.disabled = true;
+        unloadButton.disabled = true;
+        status.textContent = "Downloading NLLB: " + data.progress_percent + "% (" + downloaded + " / " + total + "). Keep Forge open.";
+        scheduleStatusRefresh(1000);
+        return;
+      }
+
+      downloadButton.disabled = Boolean(data.ready);
+      unloadButton.disabled = !data.loaded_any;
+      if (data.ready) {
+        downloadButton.textContent = "NLLB INT8 model downloaded";
+        status.textContent = data.loaded_any
+          ? "NLLB is loaded on " + (data.execution_device === "cuda" ? "GPU" : "CPU") + ": " + (data.loaded_model_path || path)
+          : "NLLB is ready to use: " + path;
+      } else if (data.error) {
+        downloadButton.textContent = "Retry NLLB INT8 download";
+        status.textContent = "NLLB download error: " + data.error;
+      } else {
+        downloadButton.textContent = "Download NLLB INT8 model (0.6 GB)";
+        status.textContent = "NLLB is not downloaded. It will be saved to: " + path;
+      }
+    };
+
+    async function refreshStatus() {
+      try {
+        const path = nllbSettingsModelPath();
+        const suffix = "status" + (path ? "?model_path=" + encodeURIComponent(path) : "");
+        renderStatus(await callNllbApi(suffix));
+      } catch (error) {
+        status.textContent = "Unable to read NLLB status: " + error.message;
+      }
+    }
+
+    downloadButton.addEventListener("click", async () => {
+      downloadButton.disabled = true;
+      status.textContent = "Starting NLLB download…";
+      try {
+        const result = await callNllbApi("download", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model_path: nllbSettingsModelPath() }),
+        });
+        if (!result.ok) {
+          throw new Error(result.error || "Unable to start NLLB download");
+        }
+        renderStatus(result);
+      } catch (error) {
+        downloadButton.disabled = false;
+        status.textContent = "Unable to start NLLB download: " + error.message;
+      }
+    });
+
+    unloadButton.addEventListener("click", async () => {
+      unloadButton.disabled = true;
+      status.textContent = "Unloading NLLB from memory…";
+      try {
+        renderStatus(await callNllbApi("unload", { method: "POST" }));
+      } catch (error) {
+        status.textContent = "Unable to unload NLLB: " + error.message;
+      }
+    });
+
+    refreshStatus();
+  }
+
   function resolveTabName(tabOrName) {
     if (!tabOrName) {
       return "";
@@ -1126,6 +1305,7 @@
   }
 
   function initializeUi() {
+    mountNllbSettingsActions();
     for (const tab of TABS) {
       mountTranslatorRow(tab);
       hookGenerateButton(tab);

@@ -1,2 +1,5 @@
 ﻿deep-translator>=1.11.4
 langdetect>=1.0.9
+sentencepiece>=0.2.0
+huggingface_hub>=0.24.0
+ctranslate2>=4.8.0

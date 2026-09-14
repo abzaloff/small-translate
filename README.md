@@ -17,6 +17,7 @@ Translate your **positive prompt** inside Forge NEO / A1111 WebUI with one key p
 - Translation runs only for **positive prompt** (negative prompt is untouched)
 - Safe fallback on translation errors (generation should not break)
 - In-memory translation cache on backend
+- Optional local **NLLB-200** provider for offline translation
 
 ## Supported Languages
 
@@ -73,10 +74,40 @@ Typical flow:
 
 In Auto Translate mode, detected source language is remembered during the session to keep mixed prompt edits translating reliably.
 
+## Local NLLB-200 provider
+
+Google remains the default provider. To translate without a network connection,
+open `Settings -> Prompt Translator`, select `NLLB-200 (local)` and click
+`Download NLLB INT8 model (0.6 GB)`. The extension downloads a CTranslate2
+INT8 conversion of the NLLB-200 600M model from
+[`JustFrederik/nllb-200-distilled-600M-ct2-int8`](https://huggingface.co/JustFrederik/nllb-200-distilled-600M-ct2-int8)
+and shows the progress. No Hugging Face account or manual file copy is required.
+
+By default the model is saved to
+`Forge/models/prompt-translator/nllb-200-distilled-600M-ct2-int8`. Change
+`NLLB local model path` before pressing the download button if another drive
+should hold the model. Click Forge's `Apply settings` after selecting the
+provider or changing this path, so the choice is retained for translation.
+
+`NLLB INT8 device` lets the user choose `GPU` (the default) or `CPU`. When the
+choice changes, the next local translation reloads the model on that device.
+
+`Unload NLLB from memory` frees RAM/VRAM while keeping the downloaded files.
+The next local translation loads the model again.
+
+The local provider currently supports the default translator languages: Russian,
+English, Chinese, Japanese, Korean, German, French, Spanish, Italian, and
+Portuguese. It loads the model only on the first local translation and keeps it
+in memory for later requests. The INT8 download is a third-party CTranslate2
+conversion of Meta's NLLB model, licensed under CC-BY-NC 4.0; review its model
+card before using it outside personal or non-commercial work.
+
 ## Limitations
 
 - This version does not yet protect advanced prompt tokens such as LoRA tags / weight groups with placeholders.
 - Live translation sends frequent network requests depending on typing speed.
+- NLLB is a local research model rather than a certified translation service;
+  long prompts are split into smaller chunks before translation.
 
 ## License
 
