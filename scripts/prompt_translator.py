@@ -1,6 +1,7 @@
 import gc
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -458,6 +459,51 @@ def _split_translation_text(text: str, chunk_size: int) -> List[str]:
     return chunks
 
 
+# NLLB is a general-purpose translation model, not an SD prompt parser. When
+# tags and prose share a line it may silently drop the tag prefix as noise. A
+# capitalized natural-language clause after comma-separated tags is a reliable
+# boundary in prompts produced by captioning tools ("..., This image ...").
+_NLLB_TAG_PREFIX_RE = re.compile(
+    r"^(?P<tags>.*?,\s*)(?P<prose>"
+    r"(?:This|The|An?|In|On|With|There|She|He|It|They)\b.*)$"
+)
+
+
+def _split_nllb_translation_units(text: str) -> List[Tuple[bool, str]]:
+    """Split local translations at safe prompt boundaries.
+
+    The boolean marks a unit that should be translated. Leading SD tags are
+    translated one-by-one so NLLB cannot discard them as a keyword list. The
+    rest is translated sentence-by-sentence, preventing one early EOS token
+    from deleting the rest of a long caption.
+    """
+    units: List[Tuple[bool, str]] = []
+    first_line, newline, remainder = text.partition("\n")
+    tag_prefix = _NLLB_TAG_PREFIX_RE.match(first_line)
+    if tag_prefix:
+        # Keep only the comma separators verbatim. Each actual tag gets its own
+        # translation request, so a phrase such as "masterpiece, best quality"
+        # is not treated by NLLB as an ignorable metadata block.
+        for tag_part in re.split(r"(,\s*)", tag_prefix.group("tags")):
+            if tag_part:
+                units.append((not bool(re.fullmatch(r",\s*", tag_part)), tag_part))
+        text = tag_prefix.group("prose") + newline + remainder
+
+    # Preserve all whitespace exactly.  Newlines (including bullet lists) and
+    # sentence endings become separate translation requests.
+    for paragraph_part in re.split(r"(\n+)", text):
+        if not paragraph_part:
+            continue
+        if paragraph_part.isspace():
+            units.append((True, paragraph_part))
+            continue
+        for sentence_part in re.split(r"(?<=[.!?])(\s+)", paragraph_part):
+            if sentence_part:
+                units.append((True, sentence_part))
+
+    return units
+
+
 def _parse_google_translation_payload(payload: object) -> str:
     try:
         return "".join(
@@ -839,7 +885,15 @@ def _load_nllb_model(model_path: str):
             except Exception:
                 pass
 
-        tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+        # CTranslate2 exports a minimal config.json without model_type. Recent
+        # transformers versions mistakenly emit a Mistral tokenizer warning for
+        # such local NLLB tokenizers. NLLB must keep its own tokenizer rules;
+        # applying the Mistral correction would make tokenization worse.
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            local_files_only=True,
+            fix_mistral_regex=False,
+        )
         model = ctranslate2.Translator(
             model_path,
             device=device,
@@ -898,8 +952,13 @@ def _translate_with_nllb(text: str, source_name: str, target_name: str) -> str:
 
     tokenizer, model = _load_nllb_model(_get_nllb_model_path())
     return "".join(
-        _translate_nllb_chunk(chunk, source_code, target_code, tokenizer, model)
-        for chunk in _split_translation_text(text, NLLB_CHUNK_SIZE)
+        unit
+        if not should_translate
+        else "".join(
+            _translate_nllb_chunk(chunk, source_code, target_code, tokenizer, model)
+            for chunk in _split_translation_text(unit, NLLB_CHUNK_SIZE)
+        )
+        for should_translate, unit in _split_nllb_translation_units(text)
     )
 
 
