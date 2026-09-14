@@ -340,7 +340,11 @@
           data.enabled_languages || data.prompt_translator_enabled_languages,
         );
         if (defaultSourceLanguage || enabledLanguages.length) {
-          return { defaultSourceLanguage, enabledLanguages };
+          return {
+            provider: typeof data.provider === "string" ? data.provider : "",
+            defaultSourceLanguage,
+            enabledLanguages,
+          };
         }
       } catch (error) {
         // Try the next endpoint; Forge builds expose extension routes differently.
@@ -358,10 +362,10 @@
         fetchedSettings.defaultSourceLanguage ||
         "Auto Detect",
       enabledLanguages:
-        pageSettings.enabledLanguages && pageSettings.enabledLanguages.length
-          ? pageSettings.enabledLanguages
-          : fetchedSettings.enabledLanguages && fetchedSettings.enabledLanguages.length
-            ? fetchedSettings.enabledLanguages
+        fetchedSettings.enabledLanguages && fetchedSettings.enabledLanguages.length
+          ? fetchedSettings.enabledLanguages
+          : pageSettings.enabledLanguages && pageSettings.enabledLanguages.length
+            ? pageSettings.enabledLanguages
             : [...DEFAULT_LANGUAGES],
     };
   }

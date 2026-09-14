@@ -95,10 +95,11 @@ choice changes, the next local translation reloads the model on that device.
 `Unload NLLB from memory` frees RAM/VRAM while keeping the downloaded files.
 The next local translation loads the model again.
 
-The local provider currently supports the default translator languages: Russian,
-English, Chinese, Japanese, Korean, German, French, Spanish, Italian, and
-Portuguese. It loads the model only on the first local translation and keeps it
-in memory for later requests. The INT8 download is a third-party CTranslate2
+The local provider supports the full NLLB/FLORES language list. Add the desired
+NLLB languages in the existing `Languages shown in the translator interface`
+setting; when NLLB is selected, the prompt dropdown only shows the checked
+languages supported by NLLB. It loads the model only on the first local
+translation and keeps it in memory for later requests. The INT8 download is a third-party CTranslate2
 conversion of Meta's NLLB model, licensed under CC-BY-NC 4.0; review its model
 card before using it outside personal or non-commercial work.
 
