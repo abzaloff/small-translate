@@ -2,8 +2,6 @@ import gc
 import json
 import os
 import re
-import shutil
-import subprocess
 import threading
 import time
 from typing import Dict, List, Tuple
@@ -367,7 +365,10 @@ _nllb_download_state = {
     "error": "",
 }
 
-GOOGLE_TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
+GOOGLE_TRANSLATE_URL = (
+    "https://translate.google.com/_/TranslateWebserverUi/data/batchexecute"
+)
+GOOGLE_TRANSLATE_RPC_ID = "MkEWBc"
 GOOGLE_TRANSLATE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -375,14 +376,14 @@ GOOGLE_TRANSLATE_HEADERS = {
         "Chrome/140.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://translate.google.com/",
 }
 GOOGLE_TRANSLATE_TIMEOUT = (5, 15)
 GOOGLE_TRANSLATE_ATTEMPTS = 3
 GOOGLE_TRANSLATE_CHUNK_SIZE = 3500
-
-
-class GoogleTranslateRateLimitError(RuntimeError):
-    """Google rejected the Python HTTP client before processing the request."""
+_google_translate_session = requests.Session()
+_google_translate_session.headers.update(GOOGLE_TRANSLATE_HEADERS)
+_google_translate_request_lock = threading.Lock()
 
 
 class TranslateRequest(BaseModel):
@@ -504,69 +505,104 @@ def _split_nllb_translation_units(text: str) -> List[Tuple[bool, str]]:
     return units
 
 
-def _parse_google_translation_payload(payload: object) -> str:
+def _build_google_rpc_request(text: str, source_code: str, target_code: str) -> str:
+    arguments = json.dumps(
+        [[text, source_code, target_code, True], [None]],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return json.dumps(
+        [[[GOOGLE_TRANSLATE_RPC_ID, arguments, None, "generic"]]],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _parse_google_rpc_response(response_text: str) -> str:
+    rpc_response = ""
+    found_rpc = False
+    bracket_depth = 0
+    in_string = False
+    escaped = False
+
+    for line in response_text.splitlines():
+        if not found_rpc:
+            found_rpc = GOOGLE_TRANSLATE_RPC_ID in line[:80]
+            if not found_rpc:
+                continue
+
+        rpc_response += line
+        for character in line:
+            if escaped:
+                escaped = False
+                continue
+            if character == "\\" and in_string:
+                escaped = True
+                continue
+            if character == '"':
+                in_string = not in_string
+            elif not in_string:
+                if character == "[":
+                    bracket_depth += 1
+                elif character == "]":
+                    bracket_depth -= 1
+
+        if bracket_depth == 0 and rpc_response:
+            break
+
+    if not rpc_response:
+        raise RuntimeError("Google Translate returned an invalid RPC response")
+
     try:
-        return "".join(
+        outer_payload = json.loads(rpc_response)
+        translation_payload = json.loads(outer_payload[0][2])
+        translation_data = translation_payload[1][0][0]
+        separator = " " if translation_data[3] else ""
+        translated_parts = [
             part[0]
-            for part in payload[0]
+            for part in translation_data[5]
             if isinstance(part, list)
             and part
             and isinstance(part[0], str)
-        )
-    except (IndexError, TypeError):
-        raise RuntimeError("Google Translate returned an invalid response") from None
+        ]
+        translated = separator.join(translated_parts)
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Google Translate returned an invalid RPC response") from exc
+
+    if not translated:
+        raise RuntimeError("Google Translate returned an empty result")
+    return translated
 
 
-def _translate_google_chunk_with_curl(
+def _request_google_translation(
     text: str,
     source_code: str,
     target_code: str,
 ) -> str:
-    curl = shutil.which("curl.exe") or shutil.which("curl")
-    if not curl:
-        raise RuntimeError("curl is not available for the Google Translate fallback")
-
-    command = [
-        curl,
-        "--silent",
-        "--show-error",
-        "--fail",
-        "--get",
-        GOOGLE_TRANSLATE_URL,
-        "--header",
-        "User-Agent: " + GOOGLE_TRANSLATE_HEADERS["User-Agent"],
-        "--header",
-        "Accept-Language: " + GOOGLE_TRANSLATE_HEADERS["Accept-Language"],
-    ]
-    for key, value in (
-        ("client", "gtx"),
-        ("dt", "t"),
-        ("sl", source_code),
-        ("tl", target_code),
-        ("q", text),
-    ):
-        command.extend(("--data-urlencode", f"{key}={value}"))
-
-    try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            check=False,
-            encoding="utf-8",
-            errors="replace",
-            timeout=sum(GOOGLE_TRANSLATE_TIMEOUT),
+    with _google_translate_request_lock:
+        response = _google_translate_session.post(
+            GOOGLE_TRANSLATE_URL,
+            params={
+                "rpcids": GOOGLE_TRANSLATE_RPC_ID,
+                "bl": "boq_translate-webserver_20201207.13_p0",
+                "soc-app": 1,
+                "soc-platform": 1,
+                "soc-device": 1,
+                "rt": "c",
+            },
+            data={
+                "f.req": _build_google_rpc_request(
+                    text,
+                    source_code,
+                    target_code,
+                )
+            },
+            timeout=GOOGLE_TRANSLATE_TIMEOUT,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError("Google Translate curl fallback failed") from exc
-
-    if completed.returncode != 0:
-        message = completed.stderr.strip() or "Google Translate curl fallback failed"
-        raise RuntimeError(message)
-
-    try:
-        return _parse_google_translation_payload(json.loads(completed.stdout))
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Google Translate returned an invalid response") from exc
+    if response.status_code == 429:
+        raise RuntimeError("Google Translate rate limit reached")
+    response.raise_for_status()
+    return _parse_google_rpc_response(response.text)
 
 
 def _translate_google_chunk(text: str, source_code: str, target_code: str) -> str:
@@ -580,44 +616,16 @@ def _translate_google_chunk(text: str, source_code: str, target_code: str) -> st
 
     for attempt in range(GOOGLE_TRANSLATE_ATTEMPTS):
         try:
-            response = requests.get(
-                GOOGLE_TRANSLATE_URL,
-                params={
-                    "client": "gtx",
-                    "dt": "t",
-                    "sl": source_code,
-                    "tl": target_code,
-                    "q": text_to_translate,
-                },
-                headers=GOOGLE_TRANSLATE_HEADERS,
-                timeout=GOOGLE_TRANSLATE_TIMEOUT,
+            translated = _request_google_translation(
+                text_to_translate,
+                source_code,
+                target_code,
             )
-            if response.status_code == 429:
-                raise GoogleTranslateRateLimitError("Google Translate rate limit reached")
-            response.raise_for_status()
-
-            try:
-                translated = _parse_google_translation_payload(response.json())
-            except (RuntimeError, ValueError) as exc:
-                raise RuntimeError("Google Translate returned an invalid response") from exc
-            if not translated:
-                raise RuntimeError("Google Translate returned an empty result")
             return leading_whitespace + translated + trailing_whitespace
         except (requests.RequestException, RuntimeError) as exc:
             last_error = exc
-            if isinstance(exc, GoogleTranslateRateLimitError):
-                break
             if attempt + 1 < GOOGLE_TRANSLATE_ATTEMPTS:
                 time.sleep(0.4 * (attempt + 1))
-
-    if isinstance(last_error, GoogleTranslateRateLimitError):
-        translated = _translate_google_chunk_with_curl(
-            text_to_translate,
-            source_code,
-            target_code,
-        )
-        if translated:
-            return leading_whitespace + translated + trailing_whitespace
 
     raise last_error
 
@@ -1019,14 +1027,6 @@ def _translate_text(text: str, source_name: str, target_name: str) -> TranslateR
             used_cache=True,
             ok=True,
             detected_source=detected_source,
-        )
-
-    if provider == GOOGLE_PROVIDER and GoogleTranslator is None:
-        return TranslateResponse(
-            translated_text=text,
-            used_cache=False,
-            ok=False,
-            error="deep-translator is not available",
         )
 
     try:
